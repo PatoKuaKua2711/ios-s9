@@ -96,6 +96,24 @@ Firmware stock: `../ZTO-G9600ZHU9FVF2` (G9600ZHU9FVF2, Android 10).
   0x62, SET_TOUCHFUNCTION 0x30 [0x61 0x00], SENSE_ON 0x10; poll a cada 10 ms com 0x60 (8 B) + 0x61 (restantes).
   Coordenadas 0..4095 -> painel 1440x2960 -> SweetHID (offset -157/-262, toque na borda gruda na beira).
   O touch fica desligado por padrão (0082): usar `sweettouch=1` (+ `sweettouchdelay=20`).
+- **boot-ios2 (cpus=8):** boot em ~7 min, botões OK, console sem piscar. Touch: "se7 fw=0x301 proto=3 ... need
+  ABL-loaded I2C firmware and 32-bit FIFOs": o firmware do SE11 tem FIFO desligado (GENI_IF_DISABLE_RO bit 0).
+- **0086/0087:** canvas do iPhone X escalado até a altura, depois esticado até 1440x2960 por padrão
+  (`sweetfb_aspect=1` mantém a proporção, `sweetfb_noscale=1` desliga). boot-ios3 = kernel 5 (run 39959555728).
+- **Touch, testado no shim M5 (2026-10-23)**, ciclos de 1 min em vez de boots de 7 min:
+  - **Energia:** o S6SY761 fica SEM energia depois do ABL. LDO2 (dvdd 1,8 V) e LDO3 (avdd 3,0 V) do S2DOS05 têm
+    `regulator-boot-on`, mas quem liga é o regulator core do Linux. S2DOS05 em 0x60 num i2c-gpio (SDA GPIO127,
+    SCL GPIO128). Lido: id=00 en=0x19 ldo2=0x8c ldo3=0x8c (tensões já certas, vsel 12). Escrevendo EN|2, 1 ms,
+    EN|6 → en=0x1f, as linhas do touch sobem (GENI_IOS 0 → 3) e o IRQ (GPIO120) desce.
+  - **GSI/GPI não dá sem votos:** a ordem certa é EV ALLOC → contexto → doorbell (eu tinha invertido; RP virava
+    lixo 0x75170000). Corrigida, os RPs batem com as bases, mas o 1º DMA trava a CPU. A tbu2 (SID 0x6d6,
+    GDSC 0x17d038) já está ligada (0x80000001); ler a SMMU (0x15000000) trava o barramento: faltam os votos de
+    barramento do Linux (msm-bus apps_smmu/QUP). Abandonado.
+  - **Bit-bang nos pinos do touch (GPIO31/32 como GPIO, dreno aberto por OE), como o i2c-gpio:** funcionou de
+    primeira, boot status + id + 5 dedos ao mesmo tempo (M5.4).
+- **0088:** o driver do touch no XNU virou isso: liga LDO2/LDO3 pelo S2DOS05, I²C bit-bang a ~150 kHz em
+  GPIO31/32, lê eventos só com o IRQ (GPIO120) em 0, poll de 5 ms. Corrige também o 0085, que só mandava o
+  toque inicial ao SweetHID (sects_event escrevia em st.x, então touch_report nunca via movimento).
 
 ## Objetivos do dono para depois do boot do iOS (2026-10-23)
 

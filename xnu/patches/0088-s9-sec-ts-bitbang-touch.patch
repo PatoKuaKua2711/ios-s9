@@ -1,0 +1,925 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index e296bd2..0d522f5 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1,14 +1,20 @@
+ /*
+- * Galaxy S9: Samsung S6SY761 (sec_ts) at 0x48 on GENI SE11 (0xa8c000),
+- * GPIO31/32 qup11, polled. Its rails (S2DOS05 LDO2/LDO3) are boot-on, so
+- * there is no power or reset sequence and no RPMh vote here. Protocol from
+- * drivers/input/touchscreen/sec_ts of the Samsung/LineageOS kernel.
+- * The I2C engine below is ios-sweet's, which follows:
+- * SWEET SE7 FIFO I2C / GT9896 Yellowstone / Focaltech 54:52 bring-up.
+- * Call once after the scheduler is running; all work runs on one thread.
+- * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+- * No firmware/config upload or direct PMIC writes. Only IC data write:
+- * zero to GT9896's event status after reading a report. See touch2/report.md.
++ * Galaxy S9: Samsung S6SY761 (sec_ts) at 0x48, read while its interrupt line
++ * (GPIO120, active low) is down. Protocol from drivers/input/touchscreen/sec_ts
++ * of the Samsung/LineageOS kernel.
++ *   - Power: the IC's rails are S2DOS05 LDO2 (dvdd 1.8 V) and LDO3 (avdd
++ *     3.0 V). The DT marks them regulator-boot-on, which makes Linux's regulator
++ *     core enable them; ABL leaves them off (EN 0x19, vsel already 0x8c). The
++ *     PMIC answers at 0x60 on a bit-banged bus (i2c-gpio: GPIO127/128). The only
++ *     PMIC writes: those two LDO enable bits, and their vsel if not 1.8/3.0 V.
++ *   - Bus: SE11 (0xa8c000) runs its I2C firmware GSI-only, and GSI DMA needs the
++ *     apps SMMU, whose registers do not answer without the bus votes Linux
++ *     makes. The touch's own pins, GPIO31/32, are bit-banged instead, the way
++ *     i2c-gpio does it.
++ * Proven first by s9port shim/m5.c (M5.4): power, boot status, id and five
++ * fingers at once. Only IC writes: CLEAR_EVENT_STACK, SET_TOUCHFUNCTION and
++ * SENSE_ON. Call once after the scheduler is running; all work runs on one
++ * thread.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -23,25 +29,22 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+ extern kern_return_t thread_terminate(thread_t);
+-extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a8c000u /* Galaxy S9: SE11 = wrapper1 S3 */
+-#define TOUCH_GCC_PA     0x00100000u
+ #define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
+-#define TOUCH_GCC_VOTE   0x5200cu
+-#define TOUCH_RCG       0x183a8u    /* Galaxy S9: wrapper1 S3 = global SE11 */
++#define TOUCH_NORTH_LEN  0x00081000u /* through GPIO128 */
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
++#define TOUCH_GPIO_OE    (1u << 9)
+ #define TOUCH_MAX        10u
+-#define TOUCH_GOODIX     1
+-#define TOUCH_FTS        2
+-/* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+-#define GOODIX_PID_REG   0x4022u
+-#define GOODIX_EVENT_REG 0x4180u
+-#define GOODIX_HEAD_LEN  8u
+-#define GOODIX_POINT_LEN 8u
++#define TOUCH_HALF_US    3           /* bit-bang half period: ~150 kHz */
++
++#define TS_SDA            31u        /* qup11 pins, as plain GPIO */
++#define TS_SCL            32u
++#define TS_IRQ            120u       /* low while events are pending */
++#define PM_SDA            127u       /* the S2DOS05's i2c-gpio bus */
++#define PM_SCL            128u
+ 
+ #define SECTS_ADDR        0x48u
+ #define SECTS_SENSE_ON    0x10u
+@@ -53,49 +56,28 @@ void sweet_touch_init(void);
+ #define SECTS_ALL_EVENT   0x61u
+ #define SECTS_CLEAR_STACK 0x62u
+ #define SECTS_EVENT_LEN   8u
++#define SECTS_BURST       8u          /* events per read: sec,i2c-burstmax = 64 */
+ #define SECTS_MAX_COORD   4096
+ #define SECTS_PANEL_W     1440
+ #define SECTS_PANEL_H     2960
+ 
+-#define SE_STATUS       0x040u
+-#define SE_MCLK         0x048u
+-#define SE_FW           0x068u
+-#define SE_CLK_SEL      0x07cu
+-#define SE_DMA          0x258u
+-#define SE_TX_LEN       0x26cu
+-#define SE_RX_LEN       0x270u
+-#define SE_SCL          0x278u
+-#define SE_CMD          0x600u
+-#define SE_CTRL         0x604u
+-#define SE_IRQ          0x610u
+-#define SE_IRQ_EN       0x614u
+-#define SE_IRQ_CLR      0x618u
+-#define SE_TX           0x700u
+-#define SE_RX           0x780u
+-#define SE_TX_COUNT     0x800u
+-#define SE_RX_COUNT     0x804u
+-#define SE_HW_TX        0xe24u
+-#define SE_HW_RX        0xe28u
+-#define SE_TX_WM        0x80cu
+-#define SE_RX_WM_IRQ    (1u << 26)
+-#define SE_RX_LAST      (1u << 27)
+-#define SE_TX_WM_IRQ    (1u << 30)
+-#define SE_DONE         (1u << 0)
+-#define SE_NACK         (1u << 10)
+-#define SE_ERRORS       (0x3eu | (1u << 9) | (1u << 10) | (1u << 12) | \
+-                         (1u << 13) | (3u << 24) | (3u << 28))
+-#define SE_EVENTS       (SE_DONE | SE_ERRORS | SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ)
+-/* geni_se_config_packing(8, 4, true, true, true): start bits 7/15/23/31,
+- * MSB-to-LSB, length 8, STOP only on vector 3. FIFO bytes remain LSB first. */
+-#define SE_PACK0        0x0007f8feu
+-#define SE_PACK1        0x000ffefeu
++#define PM_ADDR           0x60u
++#define PM_EN             0x03u       /* bit 1 LDO2, bit 2 LDO3 */
++#define PM_LDO2           0x05u       /* vsel 0-6: 1.5 V + 25 mV steps; bit 7 discharge */
++#define PM_LDO3           0x06u       /* vsel 0-6: 2.7 V + 25 mV steps */
++#define PM_VSEL           12u         /* 1.8 V and 3.0 V, the DT's min = max */
++
++struct touch_bus {
++	unsigned sda, scl;
++};
++
++static const struct touch_bus ts_bus = {TS_SDA, TS_SCL};
++static const struct touch_bus pm_bus = {PM_SDA, PM_SCL};
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
+-	bool started, dead, probing;
+-	int kind, irq_hint;
+-	uint32_t irq_status, irq_last, active;
+-	unsigned sent, got;
++	vm_offset_t gpio;
++	bool started, probing;
++	uint32_t active;
+ 	int x[TOUCH_MAX], y[TOUCH_MAX];
+ } st;
+ static int touch_sleep_chan;
+@@ -125,268 +107,240 @@ touch_wait(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
+-static bool
+-touch_wait_clear(vm_offset_t base, uint32_t off, uint32_t mask)
++static unsigned
++touch_level(unsigned pin)
+ {
+-	for (unsigned i = 0; i < 5000; ++i) {
+-		if (!(touch_rd(base, off) & mask)) {
+-			return true;
+-		}
+-		delay(1);
+-	}
+-	return false;
++	return touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & 1u;
++}
++
++/*
++ * i2c-gpio as Linux runs it: open drain by output enable, with the output
++ * latch at 0; a released line floats up on the board's pull-ups.
++ */
++static void
++bb_init(const struct touch_bus *b)
++{
++	touch_wr(st.gpio, TOUCH_GPIO_IO(b->sda), 0);
++	touch_wr(st.gpio, TOUCH_GPIO_IO(b->scl), 0);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(b->sda), 0); /* GPIO function, input, no pull, 2 mA */
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(b->scl), 0);
++	delay(20);
+ }
+ 
+ static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++bb_line(unsigned pin, bool high)
+ {
+-	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
+-	if (out) {
+-		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+-	}
+-	cfg &= ~0x3ffu;
+-	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(pin), high ? 0 : TOUCH_GPIO_OE);
++	delay(TOUCH_HALF_US);
+ }
+ 
+ static bool
+-touch_clocks(void)
++bb_scl_high(const struct touch_bus *b)
+ {
+-	/* Vote on only wrapper1 and SE11 (S3), preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 25);
+-	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+-	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+-	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+-	printf("SWEET TOUCH: gcc vote=%#x rcg=%#x cfg=%#x dfs=%#x\n",
+-	    touch_rd(st.gcc, TOUCH_GCC_VOTE), touch_rd(st.gcc, TOUCH_RCG), cfg, dfs);
+-	if (dfs & 1u) {
+-		/* SE CLK_SEL=0 selects DFS performance level 0. Do not alter tables. */
+-		cfg = touch_rd(st.gcc, TOUCH_RCG + 0x1cu);
+-		if ((cfg & 0x371fu) != 1u) {
+-			printf("SWEET TOUCH: DFS level0=%#x is not XO/1; need clock integration\n", cfg);
+-			return false;
+-		}
+-	} else {
+-		/* XO parent 0, HID divider 1 => 19.2 MHz. No PLL or voltage change. */
+-		cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;
+-		touch_wr(st.gcc, TOUCH_RCG + 4u, cfg);
+-		touch_wr(st.gcc, TOUCH_RCG, touch_rd(st.gcc, TOUCH_RCG) | 1u);
+-		if (!touch_wait_clear(st.gcc, TOUCH_RCG, 1u)) {
+-			printf("SWEET TOUCH: RCG update timeout\n");
+-			return false;
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(b->scl), 0);
++	for (unsigned i = 0; !touch_level(b->scl); ++i) {
++		if (i >= 10000) {
++			return false; /* stretched for ~10 ms: stuck */
+ 		}
++		delay(1);
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x183a4};
+-	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+-		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+-			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+-			    touch_rd(st.gcc, branches[i]));
+-			return false;
+-		}
++	delay(TOUCH_HALF_US);
++	return true;
++}
++
++static bool
++bb_start(const struct touch_bus *b)
++{
++	bb_line(b->sda, true);
++	if (!bb_scl_high(b)) {
++		return false;
+ 	}
++	bb_line(b->sda, false);
++	bb_line(b->scl, false);
+ 	return true;
+ }
+ 
+-/* Called only for a transfer started by this driver, including a stretched TX. */
+ static void
+-touch_abort(void)
++bb_stop(const struct touch_bus *b)
+ {
+-	touch_wr(st.se, SE_CTRL, 2); /* abort M command, release held bus */
+-	bool done = false;
+-	for (unsigned i = 0; i < 5000; ++i) {
+-		if (touch_rd(st.se, SE_IRQ) & (1u << 5)) {
+-			done = true;
+-			break;
++	bb_line(b->sda, false);
++	(void)bb_scl_high(b);
++	bb_line(b->sda, true);
++}
++
++/* 0, EIO (not acknowledged) or ETIMEDOUT (clock stuck) */
++static int
++bb_write(const struct touch_bus *b, uint8_t v)
++{
++	for (int i = 7; i >= 0; --i) {
++		bb_line(b->sda, ((v >> i) & 1u) != 0);
++		if (!bb_scl_high(b)) {
++			return ETIMEDOUT;
+ 		}
+-		delay(1);
++		bb_line(b->scl, false);
+ 	}
+-	if (!done || !touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true;
+-		printf("SWEET TOUCH: abort failed status=%#x irq=%#x; stopping\n",
+-		    touch_rd(st.se, SE_STATUS), touch_rd(st.se, SE_IRQ));
++	bb_line(b->sda, true);
++	if (!bb_scl_high(b)) {
++		return ETIMEDOUT;
+ 	}
+-	/* Bound drain even if the hardware reports an impossible FIFO count. */
+-	for (unsigned i = 0; i < 64 && (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu); ++i) {
+-		(void)touch_rd(st.se, SE_RX);
++	bool nack = touch_level(b->sda);
++	bb_line(b->scl, false);
++	return nack ? EIO : 0;
++}
++
++/* One byte, then ACK (more to come) or NACK (the last); -1 if the clock stuck. */
++static int
++bb_read(const struct touch_bus *b, bool ack)
++{
++	unsigned v = 0;
++	bb_line(b->sda, true);
++	for (int i = 0; i < 8; ++i) {
++		if (!bb_scl_high(b)) {
++			return -1;
++		}
++		v = (v << 1) | touch_level(b->sda);
++		bb_line(b->scl, false);
+ 	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	if (touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) {
+-		st.dead = true;
+-		printf("SWEET TOUCH: TX FIFO not empty after abort; stopping\n");
++	bb_line(b->sda, !ack);
++	if (!bb_scl_high(b)) {
++		return -1;
+ 	}
++	bb_line(b->scl, false);
++	bb_line(b->sda, true);
++	return (int)v;
+ }
+ 
+-/* Keep all observed bits for diagnostics, even if a watermark was cleared. */
+-static uint32_t
+-touch_irq(void)
++/* Address byte: an unacknowledged one means nobody is there (ENXIO). */
++static int
++bb_address(const struct touch_bus *b, uint8_t addr, bool rd)
+ {
+-	st.irq_last = touch_rd(st.se, SE_IRQ);
+-	st.irq_status |= st.irq_last;
+-	return st.irq_last;
++	int err = bb_write(b, (uint8_t)((addr << 1) | (rd ? 1u : 0u)));
++	return err == EIO ? ENXIO : err;
+ }
+ 
+-/* One Linux-style FIFO message. TX is at most 3 bytes; RX at most 90. */
++/* Register read with a repeated START, like i2c_transfer of a write and a read. */
+ static int
+-touch_msg_run(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
++i2c_rd(const struct touch_bus *b, uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n)
+ {
+-	if (st.dead || nt > 3 || nr > 90 || (nt && nr) || (!nt && !nr)) {
+-		return EIO;
++	int err = ETIMEDOUT;
++	if (!bb_start(b) || (err = bb_address(b, addr, false)) || (err = bb_write(b, reg))) {
++		goto out;
+ 	}
+-	if (!touch_wait_clear(st.se, SE_STATUS, 1u)) {
+-		st.dead = true; /* no other SE7 owner is supported */
+-		return EBUSY;
++	err = ETIMEDOUT;
++	if (!bb_start(b) || (err = bb_address(b, addr, true))) {
++		goto out;
+ 	}
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
+-	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
+-	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+-	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
+-	int err = ETIMEDOUT;
+-	for (unsigned i = 0; i < 20000; ++i) {
+-		uint32_t irq = touch_irq();
+-		if (irq & SE_ERRORS) {
+-			err = (irq & SE_NACK) ? ENXIO : EIO;
+-			/* A completed NACK is normal during address probing. Aborting an
+-			 * idle sequencer may never produce ABORT_DONE. Wait for completion
+-			 * and leave a clean idle engine available for the other IC. */
+-			for (unsigned j = 0; j < 5000 && !(irq & SE_DONE); ++j) {
+-				delay(1);
+-				irq = touch_irq();
+-			}
+-			if ((irq & SE_DONE) && !(touch_rd(st.se, SE_STATUS) & 1u) &&
+-			    !(touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) &&
+-			    !(touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-				touch_wr(st.se, SE_IRQ_CLR, irq);
+-				return err;
+-			}
+-			break;
+-		}
+-		if (nt && !st.sent && (irq & SE_TX_WM_IRQ)) {
+-			uint32_t word = 0;
+-			for (unsigned j = 0; j < nt; ++j) {
+-				word |= (uint32_t)tx[j] << (8u * j);
+-			}
+-			touch_wr(st.se, SE_TX, word);
+-			st.sent = nt;
+-			touch_wr(st.se, SE_TX_WM, 0);
+-		}
+-		uint32_t count = touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu;
+-		if (count > 64 || count > (nr - st.got + 3u) / 4u) {
+-			err = EIO;
+-			break;
+-		}
+-		while (count--) {
+-			uint32_t word = touch_rd(st.se, SE_RX);
+-			for (unsigned j = 0; j < 4 && st.got < nr; ++j) {
+-				rx[st.got++] = (uint8_t)(word >> (8u * j));
+-			}
+-		}
+-		/* DONE is checked after draining RX, so final short words aren't lost. */
+-		if (irq & SE_DONE) {
+-			/* Re-sample after the final drain; a late error must beat DONE. */
+-			irq = touch_irq();
+-			if (irq & SE_ERRORS) {
+-				continue;
+-			}
+-			touch_wr(st.se, SE_IRQ_CLR, irq);
+-			if (st.got == nr && st.sent == nt) {
+-				return 0;
+-			}
+-			err = EIO;
+-			break;
++	for (unsigned i = 0; i < n; ++i) {
++		int v = bb_read(b, i + 1u < n);
++		if (v < 0) {
++			err = ETIMEDOUT;
++			goto out;
+ 		}
+-		/* Preserve DONE/errors if they arrive during this iteration. */
+-		touch_wr(st.se, SE_IRQ_CLR, irq & (SE_RX_WM_IRQ | SE_RX_LAST | SE_TX_WM_IRQ));
+-		delay(1);
++		buf[i] = (uint8_t)v;
+ 	}
+-	touch_abort();
++out:
++	bb_stop(b);
+ 	return err;
+ }
+ 
+ static int
+-touch_msg(uint8_t addr, const uint8_t *tx, unsigned nt, uint8_t *rx,
+-    unsigned nr, bool stretch)
++i2c_wr(const struct touch_bus *b, uint8_t addr, const uint8_t *buf, unsigned n)
+ {
+-	st.irq_status = st.irq_last = 0;
+-	st.sent = st.got = 0;
+-	int err = touch_msg_run(addr, tx, nt, rx, nr, stretch);
+-	if (st.probing) {
+-		printf("SWEET TOUCH: probe xfer addr=%#x %s len=%u stretch=%u err=%d irq=%#x seen=%#x tx=%u rx=%u status=%#x\n",
+-		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+-		    err, st.irq_last, st.irq_status, st.sent, st.got,
+-		    touch_rd(st.se, SE_STATUS));
++	int err = ETIMEDOUT;
++	if (bb_start(b) && !(err = bb_address(b, addr, false))) {
++		for (unsigned i = 0; i < n && !err; ++i) {
++			err = bb_write(b, buf[i]);
++		}
+ 	}
++	bb_stop(b);
+ 	return err;
+ }
+ 
+ static int
+-touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
++pm_rd(uint8_t reg)
+ {
+-	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
+-	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
+-	    NULL, 0, true);
+-	if (err) {
+-		return err;
+-	}
+-	/* STOP_STRETCH on the pointer write retains the bus for a repeated START. */
+-	return touch_msg(addr, NULL, 0, buf, len, false);
++	uint8_t v;
++	return i2c_rd(&pm_bus, PM_ADDR, reg, &v, 1) ? -1 : v;
+ }
+ 
+-#if 0 /* Redmi GT9896 / Focaltech protocol helpers; the S9 has a sec_ts IC */
+-static int
+-touch_goodix_ack(void)
++static void
++pm_wr(uint8_t reg, uint8_t val)
+ {
+-	const uint8_t ack[3] = {GOODIX_EVENT_REG >> 8, GOODIX_EVENT_REG & 0xffu, 0};
+-	return touch_msg(0x5d, ack, sizeof(ack), NULL, 0, false);
++	uint8_t tx[2] = {reg, val};
++	(void)i2c_wr(&pm_bus, PM_ADDR, tx, 2);
+ }
+ 
+-/* Raw read only: 0x8240 is the vendor's generic/older VERSION candidate,
+- * not a second accepted GT9896 identity. Never try a four-byte Berlin pointer:
+- * on this 16-bit IC the extra bytes would be register data writes. */
+-static int
+-touch_probe_info(uint16_t reg, uint8_t *buf)
++/*
++ * What Linux's regulator core does for S2DOS05 LDO2/LDO3 (regulator-boot-on,
++ * min = max): apply the voltage, then enable, dvdd before avdd as sec_ts_power
++ * orders them. The bus pins are given back as ABL left them.
++ */
++static bool
++touch_power(void)
+ {
+-	memset(buf, 0xa5, 32);
+-	int err = touch_read(0x5d, reg, true, buf, 32);
+-	printf("SWEET TOUCH: probe info reg=%#x len=32 err=%d irq=%#x seen=%#x\n",
+-	    reg, err, st.irq_last, st.irq_status);
+-	if (!err) {
+-		for (unsigned off = 0; off < 32; off += 16) {
+-			char line[49];
+-			for (unsigned j = 0; j < 16; ++j) {
+-				(void)snprintf(line + j * 3u, 4, "%02x ", buf[off + j]);
+-			}
+-			printf("SWEET TOUCH: probe raw %#x: %s\n", reg + off, line);
+-		}
++	uint32_t cfg_sda = touch_rd(st.gpio, TOUCH_GPIO_CFG(PM_SDA));
++	uint32_t cfg_scl = touch_rd(st.gpio, TOUCH_GPIO_CFG(PM_SCL));
++	uint32_t io_sda = touch_rd(st.gpio, TOUCH_GPIO_IO(PM_SDA));
++	uint32_t io_scl = touch_rd(st.gpio, TOUCH_GPIO_IO(PM_SCL));
++	bool on = false;
++	bb_init(&pm_bus);
++	if (!touch_level(PM_SDA) || !touch_level(PM_SCL)) {
++		printf("SWEET TOUCH: S2DOS05 bus held low; power untouched\n");
++		goto out;
+ 	}
+-	return err;
++	int id = pm_rd(0), en = pm_rd(PM_EN), l2 = pm_rd(PM_LDO2), l3 = pm_rd(PM_LDO3);
++	printf("SWEET TOUCH: S2DOS05 id=%#x en=%#x ldo2=%#x ldo3=%#x\n", id, en, l2, l3);
++	if (id < 0 || en < 0 || l2 < 0 || l3 < 0 || pm_rd(PM_EN) != en ||
++	    pm_rd(PM_LDO2) != l2 || pm_rd(PM_LDO3) != l3) {
++		printf("SWEET TOUCH: S2DOS05 reads failed or unstable; power untouched\n");
++		goto out;
++	}
++	if ((en & 6) != 6) {
++		if ((l2 & 0x7f) != PM_VSEL) {
++			pm_wr(PM_LDO2, (uint8_t)((l2 & 0x80) | PM_VSEL));
++		}
++		if ((l3 & 0x7f) != PM_VSEL) {
++			pm_wr(PM_LDO3, (uint8_t)((l3 & 0x80) | PM_VSEL));
++		}
++		l2 = pm_rd(PM_LDO2);
++		l3 = pm_rd(PM_LDO3);
++		if (l2 < 0 || l3 < 0 || (l2 & 0x7f) != PM_VSEL || (l3 & 0x7f) != PM_VSEL) {
++			printf("SWEET TOUCH: LDO2/LDO3 not at 1.8/3.0 V (%#x %#x); left off\n", l2, l3);
++			goto out;
++		}
++		pm_wr(PM_EN, (uint8_t)(en | 2));
++		delay(1000);
++		pm_wr(PM_EN, (uint8_t)(en | 6));
++		delay(5000);
++		en = pm_rd(PM_EN);
++	}
++	on = en >= 0 && (en & 6) == 6;
++	printf("SWEET TOUCH: S2DOS05 en=%#x: touch rails %s\n", en, on ? "on" : "OFF");
++out:
++	touch_wr(st.gpio, TOUCH_GPIO_IO(PM_SDA), io_sda);
++	touch_wr(st.gpio, TOUCH_GPIO_IO(PM_SCL), io_scl);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(PM_SDA), cfg_sda);
++	touch_wr(st.gpio, TOUCH_GPIO_CFG(PM_SCL), cfg_scl);
++	return on;
+ }
+ 
+-static unsigned
+-touch_be16(const uint8_t *p)
++static int
++touch_read(uint8_t reg, uint8_t *buf, unsigned len)
+ {
+-	return ((unsigned)p[0] << 8) | p[1];
++	int err = i2c_rd(&ts_bus, SECTS_ADDR, reg, buf, len);
++	if (st.probing) {
++		printf("SWEET TOUCH: probe read %#x len=%u err=%d\n", reg, len, err);
++	}
++	return err;
+ }
+ 
+-static bool
+-touch_checksum(const uint8_t *buf, unsigned len)
++static int
++sects_cmd(uint8_t cmd, const uint8_t *data, unsigned n)
+ {
+-	if (len < 2) {
+-		return false;
+-	}
+-	unsigned sum = 0;
+-	for (unsigned i = 0; i + 2 < len; ++i) {
+-		sum += buf[i];
+-	}
+-	return (sum & 0xffffu) == touch_be16(buf + len - 2);
++	uint8_t tx[3] = {cmd, (uint8_t)(n > 0 ? data[0] : 0), (uint8_t)(n > 1 ? data[1] : 0)};
++	return i2c_wr(&ts_bus, SECTS_ADDR, tx, 1u + n);
+ }
+ 
+-#endif
+-
+ static void
+ touch_report(uint32_t mask, const int *x, const int *y)
+ {
+@@ -405,123 +359,9 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 	st.active = mask;
+ }
+ 
+-#if 0 /* Redmi GT9896 / Focaltech report parsers */
+-static int
+-touch_goodix(void)
+-{
+-	uint8_t buf[90];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0;
+-	int err = touch_read(0x5d, GOODIX_EVENT_REG, true, buf, GOODIX_HEAD_LEN);
+-	if (err) {
+-		return err;
+-	}
+-	if (!(buf[0] & 0x80u)) {
+-		/* Do not acknowledge firmware/config requests that we cannot service. */
+-		if (buf[0] & 0x40u) {
+-			return ENOTSUP;
+-		}
+-		return 0; /* no new touch frame: retain current contacts */
+-	}
+-	if (!touch_checksum(buf, GOODIX_HEAD_LEN)) {
+-		return EIO; /* header untrusted: no write to the IC */
+-	}
+-	unsigned n = buf[2] & 15u;
+-	if (n > TOUCH_MAX) {
+-		(void)touch_goodix_ack();
+-		return EIO;
+-	}
+-	if (n) {
+-		err = touch_read(0x5d, GOODIX_EVENT_REG + GOODIX_HEAD_LEN, true,
+-		    buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u);
+-		if (err) {
+-			return err;
+-		}
+-		if (!touch_checksum(buf + GOODIX_HEAD_LEN, n * GOODIX_POINT_LEN + 2u)) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-	}
+-	for (unsigned i = 0; i < n; ++i) {
+-		const uint8_t *p = buf + GOODIX_HEAD_LEN + i * GOODIX_POINT_LEN;
+-		unsigned id = p[0] >> 4;
+-		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+-		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+-		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px > 1079 || py > 2399) {
+-			(void)touch_goodix_ack();
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-	}
+-	err = touch_goodix_ack();
+-	if (!err) {
+-		touch_report(mask, x, y);
+-	}
+-	return err;
+-}
+-
+-static int
+-touch_focaltech(void)
+-{
+-	uint8_t buf[63];
+-	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0, seen = 0;
+-	int err = touch_read(0x38, 0, false, buf, sizeof(buf));
+-	if (err) {
+-		return err;
+-	}
+-	unsigned n = buf[2] & 15u, active = 0;
+-	if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
+-		return EIO;
+-	}
+-	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+-		const uint8_t *p = buf + 3u + 6u * i;
+-		unsigned id = p[2] >> 4, event = p[0] >> 6;
+-		if (id >= TOUCH_MAX) {
+-			break; /* vendor's unused-record sentinel */
+-		}
+-		if (seen & (1u << id)) {
+-			return EIO;
+-		}
+-		seen |= 1u << id;
+-		if (event == 1u) {
+-			continue; /* UP record */
+-		}
+-		if (event == 3u) {
+-			return EIO;
+-		}
+-		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+-		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		if (px > 1079 || py > 2399) {
+-			return EIO;
+-		}
+-		mask |= 1u << id;
+-		x[id] = (int)px;
+-		y[id] = (int)py;
+-		++active;
+-	}
+-	if (active != n) {
+-		return EIO;
+-	}
+-	touch_report(mask, x, y);
+-	return 0;
+-}
+-
+-#endif
+-
+-static int
+-sects_cmd(uint8_t cmd, const uint8_t *data, unsigned n)
+-{
+-	uint8_t tx[3] = {cmd, (uint8_t)(n > 0 ? data[0] : 0), (uint8_t)(n > 1 ? data[1] : 0)};
+-	return touch_msg(SECTS_ADDR, tx, 1u + n, NULL, 0, false);
+-}
+-
+ /* One sec_ts event: coordinates are 12-bit, 0..4095 over the whole panel. */
+ static void
+-sects_event(const uint8_t *e, uint32_t *mask)
++sects_event(const uint8_t *e, uint32_t *mask, int *xs, int *ys)
+ {
+ 	unsigned eid = e[0] & 3u, tid = (e[0] >> 2) & 0xfu, action = (e[0] >> 6) & 3u;
+ 	if (eid != 0 || tid == 0 || tid > TOUCH_MAX) {
+@@ -534,99 +374,39 @@ sects_event(const uint8_t *e, uint32_t *mask)
+ 		*mask &= ~(1u << id);
+ 		return;
+ 	}
+-	st.x[id] = x * SECTS_PANEL_W / SECTS_MAX_COORD;
+-	st.y[id] = y * SECTS_PANEL_H / SECTS_MAX_COORD;
++	/* Into the caller's copy: touch_report compares it with st to send moves. */
++	xs[id] = x * SECTS_PANEL_W / SECTS_MAX_COORD;
++	ys[id] = y * SECTS_PANEL_H / SECTS_MAX_COORD;
+ 	*mask |= 1u << id;
+ }
+ 
+-/* Like sec_ts_read_event: one event, then whatever the IC says is left. */
++/* Like sec_ts_read_event: one event, then up to a burst of what is left. */
+ static int
+ touch_sects(void)
+ {
+-	uint8_t buf[11u * SECTS_EVENT_LEN];
++	uint8_t buf[SECTS_BURST * SECTS_EVENT_LEN];
+ 	int xs[TOUCH_MAX], ys[TOUCH_MAX];
+ 	uint32_t mask = st.active;
+-	int err = touch_read(SECTS_ADDR, SECTS_ONE_EVENT, false, buf, SECTS_EVENT_LEN);
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		xs[i] = st.x[i];
++		ys[i] = st.y[i];
++	}
++	int err = touch_read(SECTS_ONE_EVENT, buf, SECTS_EVENT_LEN);
+ 	if (err) {
+ 		return err;
+ 	}
+ 	unsigned left = buf[7] & 0x3fu;
+-	sects_event(buf, &mask);
+-	while (left) {
+-		unsigned n = left > 11u ? 11u : left;
+-		err = touch_read(SECTS_ADDR, SECTS_ALL_EVENT, false, buf, n * SECTS_EVENT_LEN);
+-		if (err) {
+-			return err;
++	sects_event(buf, &mask, xs, ys);
++	if (left) {
++		/* More than a burst stays queued; the IRQ line stays down for it. */
++		unsigned n = left > SECTS_BURST ? SECTS_BURST : left;
++		err = touch_read(SECTS_ALL_EVENT, buf, n * SECTS_EVENT_LEN);
++		for (unsigned i = 0; !err && i < n; ++i) {
++			sects_event(buf + i * SECTS_EVENT_LEN, &mask, xs, ys);
+ 		}
+-		for (unsigned i = 0; i < n; ++i) {
+-			sects_event(buf + i * SECTS_EVENT_LEN, &mask);
+-		}
+-		left -= n;
+-	}
+-	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
+-		xs[i] = st.x[i];
+-		ys[i] = st.y[i];
+ 	}
+ 	touch_report(mask, xs, ys);
+-	return 0;
+-}
+-
+-static bool
+-touch_se_init(void)
+-{
+-	uint32_t fw = touch_rd(st.se, SE_FW);
+-	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+-	    touch_rd(st.se, 0x908));
+-	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+-	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+-	    ((tx >> 16) & 0x3fu) < 2u || ((rx >> 16) & 0x3fu) < 2u) {
+-		printf("SWEET TOUCH: need ABL-loaded I2C firmware and 32-bit FIFOs; probes skipped\n");
+-		return false;
+-	}
+-	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("SWEET TOUCH: SE7 already busy; probes skipped\n");
+-		return false;
+-	}
+-	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+-	touch_wr(st.se, 0xe1c, 0); /* mask external IRQ routing; poll local status */
+-	touch_wr(st.se, 0x644, 0);
+-	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+-	touch_wr(st.se, 0x648, 0xffffffffu);
+-	touch_wr(st.se, SE_DMA, 0);
+-	touch_wr(st.se, 0x28, touch_rd(st.se, 0x28) | 0x7fu);
+-	touch_wr(st.se, 0xe30, touch_rd(st.se, 0xe30) | 0x0fu);
+-	touch_wr(st.se, 0x24, 0x7f);
+-	touch_wr(st.se, 0x20, 1);
+-	touch_wr(st.se, SE_CLK_SEL, 0);
+-	touch_wr(st.se, SE_MCLK, (7u << 4) | 1u);
+-	touch_wr(st.se, SE_SCL, (10u << 20) | (11u << 10) | 26u); /* 100 kHz */
+-	/* Linux 8-bit I2C packing: MSB on the wire, LSB byte first in FIFO. */
+-	touch_wr(st.se, 0x254, 0);
+-	touch_wr(st.se, 0x260, SE_PACK0);
+-	touch_wr(st.se, 0x264, SE_PACK1);
+-	touch_wr(st.se, 0x284, SE_PACK0);
+-	touch_wr(st.se, 0x288, SE_PACK1);
+-	touch_wr(st.se, SE_TX_WM, 0);
+-	touch_wr(st.se, 0x810, 0);
+-	touch_wr(st.se, 0x814, ((rx >> 16) & 0x3fu) - 1u);
+-	touch_wr(st.se, SE_IRQ_EN, SE_EVENTS);
+-	printf("SWEET TOUCH: packing tx=%#x/%#x rx=%#x/%#x gran=%#x\n",
+-	    touch_rd(st.se, 0x260), touch_rd(st.se, 0x264),
+-	    touch_rd(st.se, 0x284), touch_rd(st.se, 0x288), touch_rd(st.se, 0x254));
+-	if (touch_rd(st.se, 0x260) != SE_PACK0 || touch_rd(st.se, 0x264) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x284) != SE_PACK0 || touch_rd(st.se, 0x288) != SE_PACK1 ||
+-	    touch_rd(st.se, 0x254) != 0) {
+-		printf("SWEET TOUCH: packing readback mismatch; probes skipped\n");
+-		return false;
+-	}
+-	if ((touch_rd(st.se, SE_TX_COUNT) & 0xfffffffu) ||
+-	    (touch_rd(st.se, SE_RX_COUNT) & 0x1ffffffu)) {
+-		printf("SWEET TOUCH: inherited FIFO data; probes skipped\n");
+-		return false;
+-	}
+-	return true;
++	return err;
+ }
+ 
+ static void
+@@ -642,28 +422,31 @@ touch_thread(void *arg, wait_result_t result)
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	printf("SWEET TOUCH: mapping GCC/TLMM/SE11\n");
+-	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+-	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+-	if (!st.gcc || !st.gpio || !st.se) {
+-		printf("SWEET TOUCH: MMIO mapping failed\n");
++	st.gpio = ml_io_map(TOUCH_NORTH_PA, TOUCH_NORTH_LEN);
++	if (!st.gpio) {
++		printf("SWEET TOUCH: TLMM mapping failed\n");
+ 		goto out;
+ 	}
+-	touch_gpio(31, 1, 0, 0, false, false); /* Galaxy S9: qup11 SDA/SCL, 2 mA, no pull */
+-	touch_gpio(32, 1, 0, 0, false, false);
+-	if (!touch_clocks() || !touch_se_init()) {
++	if (!touch_power()) {
++		goto out;
++	}
++	touch_wait(200); /* sec_ts boot after power on */
++	bb_init(&ts_bus);
++	printf("SWEET TOUCH: lines sda=%u scl=%u irq=%u\n",
++	    touch_level(TS_SDA), touch_level(TS_SCL), touch_level(TS_IRQ));
++	if (!touch_level(TS_SDA) || !touch_level(TS_SCL)) {
++		printf("SWEET TOUCH: touch bus held low; stopping\n");
+ 		goto out;
+ 	}
+ 	uint8_t status = 0, id[3] = {0, 0, 0};
+ 	const uint8_t func[2] = {SECTS_FUNC_TOUCH, 0};
+ 	st.probing = true;
+-	int e1 = touch_read(SECTS_ADDR, SECTS_BOOT_STATUS, false, &status, 1);
+-	int e2 = touch_read(SECTS_ADDR, SECTS_DEVICE_ID, false, id, sizeof(id));
++	int e1 = touch_read(SECTS_BOOT_STATUS, &status, 1);
++	int e2 = touch_read(SECTS_DEVICE_ID, id, sizeof(id));
+ 	st.probing = false;
+ 	printf("SWEET TOUCH: sec_ts 0x48 boot=%#x/%d id=%02x%02x%02x/%d\n",
+ 	    status, e1, id[0], id[1], id[2], e2);
+-	if (e1 || e2 || st.dead) {
++	if (e1 || e2) {
+ 		printf("SWEET TOUCH: sec_ts not answering; stopping\n");
+ 		goto out;
+ 	}
+@@ -672,23 +455,24 @@ touch_thread(void *arg, wait_result_t result)
+ 		printf("SWEET TOUCH: sec_ts start failed; stopping\n");
+ 		goto out;
+ 	}
+-	printf("SWEET TOUCH: sec_ts sensing, 1440x2960, poll=10ms\n");
++	printf("SWEET TOUCH: sec_ts sensing, 1440x2960, read while IRQ low, poll=5ms\n");
+ 	unsigned errors = 0;
+-	while (!st.dead) {
+-		int err = touch_sects();
+-		if (err) {
+-			if ((errors++ % 100u) == 0) {
+-				printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+-			}
+-			if (errors == 10) {
+-				touch_report(0, st.x, st.y); /* release after persistent bad reads */
++	for (;;) {
++		if (!touch_level(TS_IRQ)) {
++			int err = touch_sects();
++			if (err) {
++				if ((errors++ % 100u) == 0) {
++					printf("SWEET TOUCH: report err=%d\n", err);
++				}
++				if (errors == 10) {
++					touch_report(0, st.x, st.y); /* release after persistent bad reads */
++				}
++			} else {
++				errors = 0;
+ 			}
+-		} else {
+-			errors = 0;
+ 		}
+-		touch_wait(10);
++		touch_wait(5);
+ 	}
+-	touch_report(0, st.x, st.y);
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+@@ -697,10 +481,7 @@ out:
+ void
+ sweet_touch_init(void)
+ {
+-	/*
+-	 * Galaxy S9: off unless asked. This is the Redmi's Goodix GT9896 path and
+-	 * it votes RPMh "ldoc11" to 3.2 V, a rail that means something else on SDM845.
+-	 */
++	/* Galaxy S9: off unless asked (boot-arg sweettouch=1). */
+ 	int enabled = 0;
+ 	thread_t thread;
+ 	if (st.started) {
+@@ -708,7 +489,6 @@ sweet_touch_init(void)
+ 	}
+ 	st.started = true;
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+-	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
