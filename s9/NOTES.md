@@ -4,7 +4,7 @@ Referência: ios-sweet (`../ref/sweet/ios-sweet-main`, MIT): XNU + userland do i
 Kernel Samsung/LineageOS 20 do S9: `../ref/kernel/android_kernel_samsung_sdm845-lineage-20`.
 Firmware stock: `../ZTO-G9600ZHU9FVF2` (G9600ZHU9FVF2, Android 10).
 
-## Estado (2026-10-22)
+## Estado (2026-10-23)
 
 - M0: arquivos descompactados, boot.img stock desmontado, fatos de hardware conferidos no DTB stock (abaixo).
   Empacotamento testado com Image falso: header igual ao stock, DTBs intactos.
@@ -114,6 +114,39 @@ Firmware stock: `../ZTO-G9600ZHU9FVF2` (G9600ZHU9FVF2, Android 10).
 - **0088:** o driver do touch no XNU virou isso: liga LDO2/LDO3 pelo S2DOS05, I²C bit-bang a ~150 kHz em
   GPIO31/32, lê eventos só com o IRQ (GPIO120) em 0, poll de 5 ms. Corrige também o 0085, que só mandava o
   toque inicial ao SweetHID (sects_event escrevia em st.x, então touch_report nunca via movimento).
+
+- **🎉 boot-ios4 = TOUCH FUNCIONANDO NO iOS (2026-10-23):** kernel 6 (run 39991709646, 0082-0088) + boot-args abaixo,
+  gravado com `tools/flash-twrp.sh` (readback ok, sha f382e672...). Vídeo do dono (37 s): desbloqueia arrastando,
+  tela inicial, Ajustes > Acessibilidade > AssistiveTouch, Geral > Sobre (iOS 16.7.16, iPhone X, 17 GB / 3,96 GB
+  livres), Siri pelo botão lateral. Volume+/- e power OK.
+  Boot-args: `debug=0xc serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam -noprogress rd=ufsroot0
+  unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 ufswait=1
+  launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweettouch=1 sweettouchdelay=20 sweetusb=0
+  sweetsample=MSUEarlyBootTask,launchd,SpringBoard,backboardd`. Receita: payload com `tools/mkpayload.py`, depois
+  `PAYLOAD=out/payload-ios4.bin ./build.sh m4` (o kernel do CI vai em `../work/s9-kernel-6`).
+  **Problemas vistos:** interface lenta (render só na CPU, sem GPU) e apagar a tela pelo power demora muito.
+
+## Próximos passos (para a próxima conversa)
+
+1. **Fluidez** (pedido do dono depois do vídeo). Não existe driver iOS pra Adreno: o render continua na CPU.
+   Investigar nesta ordem, medindo antes e depois (`sweetsample` / fps no log):
+   - se os 4 A75 (núcleos 4-7, 2,8 GHz) estão mesmo rodando o backboardd/SpringBoard, e o clock deles (o ABL
+     pode deixá-los baixos; frequência via OSM/cpucp do SDM845, ver o kernel Lineage);
+   - o caminho de cópia/escala do sweetfb (0086: estica 1125x2436 -> 1440x2960 na CPU a cada quadro; testar
+     `sweetfb_noscale=1` / `sweetfb_aspect=1` e `sweetfb_hz`), NEON e cache na cópia;
+   - reduzir efeitos (Ajustes > Acessibilidade > Reduzir movimento / transparência) como paliativo imediato.
+   - **Tela apagando devagar:** provavelmente a animação de apagar renderizada na CPU e/ou o backlight/DPMS sem
+     driver (o sweet faz o quê no power?). Ver no log o que o backboardd faz ao apertar o power.
+2. **Internet por USB** (CDC-ECM, `sweetusb=2`), testando no shim primeiro (novo stage). Levantado:
+   - DWC3 em 0xa600000, QSCRATCH 0x0a6f8800 (overrides de VBUS como no sweet_usb.c), GDSC usb30_prim 0x10f004,
+     QUSB2 PHY v2 em 0x88e2000 (init-seq no DT `qcom,qusb-phy-init-seq`), SS PHY QMP 0x88e8000, ahb2phy 0x88ee000.
+   - O ABL da Samsung NÃO deixa o USB ligado (o Redmi sim, por fastboot): ligar GDSC, clocks (conferir offsets
+     do sweet = SM7150 no gcc-sdm845.c) e PHY do zero. PHY precisa de vdd/vdda18/vdda33 via RPMh
+     (sweet_rpmh.c tem endereços do SM7150: conferir RSC/TCS no SDM845).
+   - **Risco:** DMA do USB passa pela SMMU (SID 0x740, anoc_2_tbu), igual ao GPI que travou. O 1º teste no shim é
+     exatamente o controlador escrever na RAM; o PC vê o dispositivo no `dmesg`. Se travar: votos BCM no RPMh.
+3. Depois: Sileo/NewTerm/ElleKit, boot mais rápido (~7 min hoje), relógio (sem RTC), 4 GB de RAM.
+   Wi-Fi (WCN3990 via modem, QMI, rmtfs sem escrever EFS) fica pra bem depois: semanas a meses.
 
 ## Objetivos do dono para depois do boot do iOS (2026-10-23)
 
