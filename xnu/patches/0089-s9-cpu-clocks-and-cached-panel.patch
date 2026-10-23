@@ -1,0 +1,229 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 2545cf9..82b1454 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -121,12 +121,81 @@ SweetCPU::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * Galaxy S9: CPU and L3 clocks. ABL leaves gold at its lowest row (825 MHz)
++ * and nothing in XNU does DCVS, so pick fixed rows the way Linux's
++ * clk-cpu-osm does (SDM845 OSM v2): XBL already loaded the frequency table
++ * (FREQ_REG, 40 rows), the OSM handles voltage itself, the kernel only writes
++ * a row index to DCVS_PERF_STATE_DESIRED. Silver and L3 stay at or below
++ * qcom,mx-turbo-freq (1689.6 / 1478.4 MHz): above it Linux votes the MX rail
++ * to turbo over RPMh, which we do not do. Tested in shim M6: gold 825 -> 2706
++ * MHz measured. Boot-args: sweetcpu=0 leaves ABL's clocks, sweetcpu_mhz=N
++ * caps gold (default 2649, the top row for all four cores).
++ */
++#define SWEET_OSM_ROWS          40
++#define SWEET_OSM_FREQ(i)       (0x110 + 32 * (i))
++#define SWEET_OSM_DCVS_CTRL     0xbc
++#define SWEET_OSM_PSTATE        0x700
++#define SWEET_OSM_DESIRED(c)    (0x920 + 4 * (c))
++
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++static void
++sweet_osm_set(const char *name, uint64_t phys, uint32_t max_mhz, bool per_core_ok)
++{
++	volatile uint32_t *osm = (volatile uint32_t *)ml_io_map(phys, 0x1000);
++	uint32_t prev_khz = 0, prev_cc = 0, best_khz = 0;
++	int best = -1;
++
++	for (int i = 0; i < SWEET_OSM_ROWS; i++) {
++		uint32_t v = osm[SWEET_OSM_FREQ(i) / 4];
++		uint32_t khz = (v >> 30) ? 19200 * (v & 0xff) : 300000;
++		uint32_t cc = (v >> 16) & 7;
++		if (i > 0 && khz == prev_khz && cc == prev_cc) {
++			break;          /* the table repeats its last row */
++		}
++		prev_khz = khz;
++		prev_cc = cc;
++		if (cc == 4 && khz / 1000 <= max_mhz && khz >= best_khz) {
++			best = i;
++			best_khz = khz;
++		}
++	}
++	if (best < 0) {
++		IOLog("SWEET CPU: %s OSM: no row <= %u MHz, left as is\n", name, max_mhz);
++		return;
++	}
++	uint32_t was = osm[SWEET_OSM_DESIRED(0) / 4];
++	bool per_core = per_core_ok && (osm[SWEET_OSM_DCVS_CTRL / 4] & 1);
++	for (int c = 0; c < (per_core ? 4 : 1); c++) {
++		osm[SWEET_OSM_DESIRED(c) / 4] = (uint32_t)best;
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	IOLog("SWEET CPU: %s OSM row %u -> %d (%u MHz)\n", name, was, best, best_khz / 1000);
++}
++
++static void
++sweet_cpu_clocks(void)
++{
++	uint32_t on = 1, gold_mhz = 2649;
++	PE_parse_boot_argn("sweetcpu", &on, sizeof(on));
++	PE_parse_boot_argn("sweetcpu_mhz", &gold_mhz, sizeof(gold_mhz));
++	if (!on) {
++		IOLog("SWEET CPU: clocks left as ABL set them (sweetcpu=0)\n");
++		return;
++	}
++	sweet_osm_set("L3", 0x17d41000ULL, 1478, false);
++	sweet_osm_set("silver", 0x17d43000ULL, 1689, true);
++	sweet_osm_set("gold", 0x17d45800ULL, gold_mhz, true);
++}
++
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */
+ void
+ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
+ {
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	uint32_t requested = 1;
++	sweet_cpu_clocks();
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+ 	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+ 	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 71eba1e..af1a84f 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -120,12 +120,23 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	/*
++	 * Galaxy S9: the panel memory through the CPU caches. Write-combined it
++	 * ran at ~200 MB/s for writes and ~22 MB/s for reads (shim M6): ~85 ms
++	 * per 17 MB frame and seconds for the power-off fade. Cached, each
++	 * frame's rows are cleaned to RAM for the scanout (sweetfb_wc=1: old way).
++	 */
++	IOMemoryMap  *fCacheMap;
++	bool          fCached;
++	uint32_t      fCleanY0, fCleanY1;     /* panel rows written since the last clean */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void markRows(int64_t y0, int64_t y1);
++	void cleanRows(void);
+ 	void presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ };
+@@ -223,6 +234,17 @@ AppleCLCD::start(IOService *provider)
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
++	int wc = 0;
++	PE_parse_boot_argn("sweetfb_wc", &wc, sizeof(wc));
++	if (!wc && fSurface != NULL && fSurface->memory != NULL) {
++		fCacheMap = fSurface->memory->map(kIOMapCopybackCache);
++		if (fCacheMap != NULL) {
++			fPixels = (uintptr_t)fCacheMap->getVirtualAddress();
++			fCached = true;
++		}
++	}
++	fCleanY0 = fHeight;
++	fCleanY1 = 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+ 		IOLog("SWEET FB: setup failed\n");
+@@ -244,8 +266,9 @@ AppleCLCD::start(IOService *provider)
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+-	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, %s\n",
++	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
++	    fCached ? "cached" : "write-combined");
+ 	return true;
+ }
+ 
+@@ -281,6 +304,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++			fb->markRows(0, fb->fHeight);
++			fb->cleanRows();
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -297,6 +322,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	IOLockUnlock(fb->fLock);
+ 	if (rec != NULL) {
+ 		fb->present(rec);
++		fb->cleanRows();
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -321,6 +347,43 @@ AppleCLCD::removeClient(IOMobileFramebufferUserClient *client)
+ 	IOLockUnlock(fLock);
+ }
+ 
++void
++AppleCLCD::markRows(int64_t y0, int64_t y1)
++{
++	if (y0 < 0) {
++		y0 = 0;
++	}
++	if (y1 > (int64_t)fHeight) {
++		y1 = fHeight;
++	}
++	if (y0 >= y1) {
++		return;
++	}
++	if ((uint32_t)y0 < fCleanY0) {
++		fCleanY0 = (uint32_t)y0;
++	}
++	if ((uint32_t)y1 > fCleanY1) {
++		fCleanY1 = (uint32_t)y1;
++	}
++}
++
++/* Push the written rows out of the CPU caches to RAM, where the MDSS reads them. */
++void
++AppleCLCD::cleanRows(void)
++{
++	if (fCached && fCleanY0 < fCleanY1) {
++		uintptr_t a = (fPixels + (uint64_t)fCleanY0 * fRowBytes) & ~(uintptr_t)63;
++		uintptr_t end = fPixels + (uint64_t)fCleanY1 * fRowBytes;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		for (; a < end; a += 64) {
++			__asm__ volatile ("dc cvac, %0" : : "r"(a) : "memory");
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
++	fCleanY0 = fHeight;
++	fCleanY1 = 0;
++}
++
+ static uint32_t
+ get32(const uint8_t *p, uint32_t off)
+ {
+@@ -373,6 +436,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				for (uint32_t y = 0; y < fHeight; y++) {
+ 					bzero((void *)(fPixels + (uint64_t)y * fRowBytes), (size_t)fWidth * 4);
+ 				}
++				markRows(0, fHeight);
+ 			}
+ 		}
+ 	}
+@@ -449,6 +513,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
++			markRows(dy, (int64_t)dy + h);
+ 			for (int32_t y = 0; y < h; y++) {
+ 				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+@@ -500,6 +565,7 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 		px1 = fPanW;
+ 	}
+ 	const uintptr_t base = src + s->offset;
++	markRows((int64_t)fPanY + py0, (int64_t)fPanY + py1);
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t ly = (int32_t)((int64_t)py * fLogicalH / fPanH);
+ 		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly - dy) * s->bytesPerRow) + sx - dx;
