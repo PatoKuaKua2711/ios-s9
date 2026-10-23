@@ -1,0 +1,51 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index cf74224..71eba1e 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -188,15 +188,20 @@ AppleCLCD::start(IOService *provider)
+ 	fOffX = ((int32_t)fLogicalW - (int32_t)fWidth) / 2;
+ 	fOffY = ((int32_t)fLogicalH - (int32_t)fHeight) / 2;
+ 	/*
+-	 * Galaxy S9: fill the panel instead of a small window. Keep the aspect
+-	 * ratio: the 1125x2436 canvas becomes 1367x2960 (1.215x), with two 36 px
+-	 * bars, nearest-neighbour through a column table. SweetHID mirrors this.
++	 * Galaxy S9: fill the panel instead of a small window, nearest-neighbour
++	 * through a column table; SweetHID mirrors the mapping. Default: stretch
++	 * to exactly 1440x2960 (1.28x by 1.215x, ~5 % wider than true). With
++	 * sweetfb_aspect=1 keep the aspect: 1366x2960 with 37 px side bars.
+ 	 */
+-	int noscale = 0;
++	int noscale = 0, aspect = 0;
+ 	PE_parse_boot_argn("sweetfb_noscale", &noscale, sizeof(noscale));
++	PE_parse_boot_argn("sweetfb_aspect", &aspect, sizeof(aspect));
+ 	fScale = !native && !noscale && (fLogicalW < fWidth || fLogicalH < fHeight);
+ 	if (fScale) {
+-		if ((uint64_t)fWidth * fLogicalH >= (uint64_t)fHeight * fLogicalW) {
++		if (!aspect) {
++			fPanW = (int32_t)fWidth;
++			fPanH = (int32_t)fHeight;
++		} else if ((uint64_t)fWidth * fLogicalH >= (uint64_t)fHeight * fLogicalW) {
+ 			fPanH = (int32_t)fHeight;
+ 			fPanW = (int32_t)((uint64_t)fLogicalW * fHeight / fLogicalH);
+ 		} else {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 7eca4e9..7f3c20b 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -441,10 +441,14 @@ SweetHIDTouch::start(IOService *provider)
+ 	fLogicalH = native ? 2960 : 2436;
+ 	fOffX = (fLogicalW - 1440) / 2;
+ 	fOffY = (fLogicalH - 2960) / 2;
+-	int noscale = 0;
++	int noscale = 0, aspect = 0;
+ 	PE_parse_boot_argn("sweetfb_noscale", &noscale, sizeof(noscale));
++	PE_parse_boot_argn("sweetfb_aspect", &aspect, sizeof(aspect));
+ 	fScale = !native && !noscale;
+-	if ((int64_t)1440 * fLogicalH >= (int64_t)2960 * fLogicalW) {
++	if (!aspect) {
++		fPanW = 1440;
++		fPanH = 2960;
++	} else if ((int64_t)1440 * fLogicalH >= (int64_t)2960 * fLogicalW) {
+ 		fPanH = 2960;
+ 		fPanW = (int)((int64_t)fLogicalW * 2960 / fLogicalH);
+ 	} else {
