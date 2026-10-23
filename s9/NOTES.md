@@ -74,6 +74,29 @@ Firmware stock: `../ZTO-G9600ZHU9FVF2` (G9600ZHU9FVF2, Android 10).
   Shim m4 = loader.c do sweet com boot_args.Video do fb.c. CI: fork de dipa-studio/ios-sweet (precisa de login).
   Boot-args do 1º boot: sem ufsrw/rootrw (UFS só leitura, sem log persistente), sweettouch=0 sweetkeys=0 sweetusb=0.
 
+- **M4: XNU RODOU NO S9 (2026-10-23)**, com o kernel do CI do sweet + ADT do S9: IOKit, autotestes, UFS LUN0
+  (userdata 115519 MiB read-only), e depois loop de "unknown Volume Signature c449" (userdata ainda da LineageOS).
+- Fork **syncmodz/ios-s9** (CI ok em ~6 min). Kernel 1 = 0082; kernel 2 (run 39946975709, sha a93c6d7b) = 0082 + **0083**
+  (canvas do iPhone X 1125x2436 centralizado no painel 1440x2960; sem isso o sweet cai no tamanho nativo).
+- Ferramentas compiladas sem root em `toolchain/bin` (apfs-fuse com CMAKE_POLICY_VERSION_MINIMUM=3.5 e
+  `-include cstdint`; hfs do glaubitz, branch linux, compilado fora do caminho com espaços; lzfse).
+  O fsck.hfsplus não aceita arquivo comum: rodar via `losetup`. `research/ipsw-x/d22ap.adt` vem da IPSW (IM4P LZFSE).
+- **Root v1:** `../work/iosroot/ios16-root-v1.img` (mkiosroot.sh do sweet como root + sweet-root-tweaks.py; 12 GB
+  usados de 16), gravado na **userdata** com `tools/flash-userdata.sh` (gzip + adb shell -T, readback sha256 421fccb4).
+  Boot `out/boot-ios1.img` (sha 54cf699e): kernel 2 + boot-args do sweet com cpus=4, ufsrw=1 rootrw=1, console
+  visível, touch/teclas/USB desligados. Log persistente: `tools/sweet-log-pull.sh logs/X.txt` (TWRP).
+
+- **🎉 TELA DE BLOQUEIO DO iOS 16.7.16 NO S9 (2026-10-23, boot-ios1):** logo da Apple, depois o SpringBoard com a
+  tela de bloqueio (relógio em 31/dez porque não há RTC, bateria 100 % carregando do SweetBattery), centralizada
+  no painel. Boot de ~15 min com cpus=4 (A55). Console por cima piscando (sem noconsole). Sem touch/botões.
+- **0084:** volume+ do S9 = GPIO6 do PM8998 (SID 0, PPID 0x0c5, regs 0xc5xx); power/volume- = PON 0x810 como no
+  Redmi; teclas ligadas por padrão. Com sweetfb_noconsole=1, limpa as bordas do painel no 1º quadro da GUI.
+- **0085:** touch S6SY761 (sec_ts) no SE11 0xa8c000 (GPIO31/32 qup11, voto GCC 0x5200c bits 18-21 + 25, RCG
+  0x183a8, CBCR 0x183a4). Sem reset/RPMh: S2DOS05 LDO2/LDO3 são `regulator_boot_on`. Sequência: CLEAR_EVENT_STACK
+  0x62, SET_TOUCHFUNCTION 0x30 [0x61 0x00], SENSE_ON 0x10; poll a cada 10 ms com 0x60 (8 B) + 0x61 (restantes).
+  Coordenadas 0..4095 -> painel 1440x2960 -> SweetHID (offset -157/-262, toque na borda gruda na beira).
+  O touch fica desligado por padrão (0082): usar `sweettouch=1` (+ `sweettouchdelay=20`).
+
 ## Objetivos do dono para depois do boot do iOS (2026-10-23)
 
 Usar como um iPhone com jailbreak, publicado como fork no GitHub com créditos (sweet MIT, Apple APSL, sem binários
