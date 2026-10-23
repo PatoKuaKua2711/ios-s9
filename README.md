@@ -1,3 +1,23 @@
+# ios-s9: iOS 16 on the Samsung Galaxy S9 (SM-G9600)
+
+**Work in progress.** A port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) to the
+Snapdragon Galaxy S9 (`starqltechn`, SDM845): Apple's open-source XNU plus the unmodified iPhone X (iPhone10,3)
+iOS 16.7.16 userland, booted bare-metal from Samsung's bootloader. All the hard work below is ios-sweet's; this
+fork adds what differs on the S9:
+
+- `s9/`: bare-metal shim for Samsung ABL (boot.img v0, Image.gz + stock DTBs), flashed with TWRP + dd (Heimdall's
+  retry corrupts flashes on this phone). Milestones so far: framebuffer (the S6E3HA8 is a command-mode panel, but
+  ABL leaves pingpong autorefresh on), 8 cores via PSCI, GICv3 + timer IRQs, UFS read-only probe, 16K MMU.
+  Bring-up log in `s9/NOTES.md`.
+- `xnu/patches/0082-s9-galaxy-s9-bringup.patch`: early console on the S9 splash (0x9d400000, 1440x2960) and the
+  Redmi-only touch / keys / USB drivers off by default.
+- `tools/mkadt.py`: S9 device tree (RAM 0x100000000 + 0x7e1c0000, framebuffer, Kryo 385).
+
+iOS is Apple's and is not distributed here. Credits: ios-sweet (dipa-studio, MIT), Apple's open-source releases,
+blacktop/darwin-xnu-build, the Samsung/LineageOS SDM845 kernel sources for hardware details.
+
+---
+
 # ios-sweet
 
 **Apple's iOS 16 running on a Redmi Note 10 Pro.**

@@ -8,3 +8,11 @@ shim/out/
 xnu/out/
 xnu/out-*/
 __pycache__/
+
+# Galaxy S9 port: local toolchain, build output, and anything from the phone or
+# Samsung's firmware (stock DTBs, live DTB and command line carry serials).
+s9/toolchain/
+s9/out/
+s9/dtb/
+s9/backup/
+s9/logs/
