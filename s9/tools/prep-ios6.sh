@@ -119,6 +119,12 @@ EOF
 
 python3 -I "$here/tools/jb-launchd.py" "$mnt"
 python3 -I "$here/tools/trim-daemons.py" "$mnt/System/Library/xpc/launchd.plist" --apply
+# No Bluetooth hardware: mediaserverd's BTAudioHALPlugin looked bluetoothd up over
+# XPC forever (launchd ~70 % + mediaserverd ~50 % of a core at idle).
+if [ -d "$mnt/System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver" ]; then
+	mkdir -p "$mnt/Library/Audio/Plug-Ins/HAL.disabled"
+	mv "$mnt/System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver" "$mnt/Library/Audio/Plug-Ins/HAL.disabled/"
+fi
 sync
 umount "$mnt"
 "$fsck" -fy "$loop" >/dev/null || echo "fsck: exit $? (repaired or warnings)"

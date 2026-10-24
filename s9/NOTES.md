@@ -168,6 +168,49 @@ Firmware stock: `../ZTO-G9600ZHU9FVF2` (G9600ZHU9FVF2, Android 10).
 - **Controle remoto:** `tools/s9ssh.sh [cmd]`, `tools/s9-twrp.sh` (iOS → TWRP sem botões), `tools/s9-log.py ARQ`
   (log do kernel ao vivo, UDP 5140). boot-ios6 = kernel 8 + boot-args do ios4 + `sweetusb=2 cs_enforcement_disable=1`.
 
+## Mapa de gargalos de fluidez (2026-10-24, medido com spindump + tools/s9-cpu.sh)
+
+Ferramentas novas: `tools/s9-cpu.sh N` (CPU por processo em N s, o iOS não tem top), `spindump` (existe no
+aparelho: `spindump -notarget 5 20 -file X`) + `tools/spin-sym.py` (simboliza pelo dyld cache da IPSW em
+`../work/dsc`, UUID 8F970452, via `ipsw dyld a2s`; ipsw 3.1.739 em ~/.local/bin). Log ao vivo: `s9-log.py`.
+
+Resolvidos (repouso: **460% → 52% de CPU**):
+1. securityd chamava AKS sel 10 (`aks_wrap_key`) ~300x/s, "unsupported", em loop: 80% de um núcleo + o log de
+   cada chamada. **0092**: wrap/unwrap = tag de 8 bytes + chave (sem SEP não há segredo; keychain NÃO é
+   protegido em repouso) e log só da 1ª chamada por seletor.
+2. mediaserverd: `BTAudioHALPlugin` procurava o bluetoothd (removido no trim) por XPC sem parar → launchd 70% +
+   mediaserverd 50%. Movido para `/Library/Audio/Plug-Ins/HAL.disabled/` (falta pôr no prep-ios6.sh).
+3. SpringBoard 33% ocioso: `CHUISWidgetHostViewController sceneDidDeactivate` reativava a cena do widget sem
+   fim, porque o trim tirou o **chronod**. trim-daemons.py agora mantém o chronod.
+4. promotedcontentd/adprivacyd (anúncios): 30%. Removidos no trim.
+5. **Escalonador**: XNU pega a CPU ociosa de menor número (`lsb_first`) → render/UI/realtime caíam nos A55
+   (0-3) com os A75 ociosos. **0092** (`sweetfast=0xf0`): RT e prioridade >= 31 vão para A75 livre (podem tirar
+   uma thread de fundo de lá); fundo vai para A55. Render do CA = 1 thread prio 54 + `dispatch_apply`
+   (rasteriza linhas em paralelo).
+6. vsync a 60 Hz com tela a 30 Hz: CA renderizava o dobro de quadros. **0092**: vsync = sweetfb_hz, e a
+   apresentação roda no swap, numa work loop própria (antes esperava o próximo tick e travava o vsync).
+7. Thread do touch (bit-bang, ~0,7 ms a cada 5 ms com dedo na tela, prioridade de kernel) iria para os A75.
+   **0094**: presa na CPU 1 (A55).
+8. `-enable_kprintf_spam`: kprintf com interrupções desligadas + lock global. Fora do cmdline de uso
+   (boot-ios9), junto com `sweetsample=-`.
+
+Em andamento:
+9. Pixels do render (custo do CA SW é proporcional): @3x 1125x2436 = 2,74 Mpx → **@2x 750x1624 = 1,22 Mpx**
+   (mesmos 375x812 pt). **0093** lê o canvas do ADT; `mkadt.py --scale2`. boot-ios9-s2 = @2x, -s3 = @3x.
+   Antes de trocar a escala: apagar `systemgroup.com.apple.lsd.iconscache/Library/Caches/*` e
+   `/var/mobile/Library/SplashBoard/Snapshots/*` (não há cache do MobileGestalt).
+10. Apresentação na CPU: 10 ms/quadro (@3x) → 8,4 ms (@2x + linhas repetidas por memcpy, 0093). Final: o próprio
+   MDSS lê a IOSurface (zero-copy) e escala com QSEED3 → 0 ms. Teste **shim M9** (`./build.sh m9`).
+11. Hot spots do renderizador (spindump): `CA::OGL::SW::circle_sampler` (cantos/círculos: ícones e o tweak
+   ShowMyTouches), `sample_texture`, `scan_convert`/`scanline`, `memset_pattern16`, `tex_multiply_color`.
+
+Próximos (precisam de teste no shim antes):
+12. Banda de DDR/LLCC: BCM MC0/SH0 nunca votados (ficam no que o ABL deixou); o render é limitado por memória.
+13. L3 1478 → 1958 MHz e prata 1689 → 1766 exigem voto ARC do trilho MX (cmd-db `mx.lvl`).
+Não são gargalo (medido): disco UFS (394 MB/s leitura, 170 MB/s escrita), RAM (~1 GB livre), sampler.
+GPU: não existe driver Metal para Adreno; os forks que ligam o Adreno usam-no só como copiador (blit), o que o
+MDSS (item 10) faz melhor e sem GPU.
+
 ## Próximos passos (para a próxima conversa)
 
 1. **Fluidez** (pedido do dono depois do vídeo). Não existe driver iOS pra Adreno: o render continua na CPU.
