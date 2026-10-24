@@ -16,8 +16,8 @@ import adt  # noqa: E402
 # Galaxy S9: one bank 0x80000000 + 0xfe1c0000; every fixed carve-out sits below
 # 4GB, so the kernel gets the whole range from 0x100000000 (with or without
 # --highmem).
-PHYS_BASE = 0x100000000
-MEM_SIZE = 0x7e1c0000
+PHYS_BASE = 0xa6000000
+MEM_SIZE = 0xd81c0000   # 0xa6000000 (acima do staging do ABL) -> 0x17e1c0000   # 0xa1800000 -> 0x17e1c0000 span (holes excluded in pmap)
 # Panic log buffer, carved from the TOP of the dram range and exposed to XNU as
 # /pram + /chosen/embedded-panic-log-size. Without it, pe_init.c's
 # check_for_panic_log() leaves gPanicBase == 0, debug_log_init() bails out twice
@@ -27,8 +27,8 @@ PANIC_LOG_SIZE = 0x100000
 # --highmem (phone only): the whole upper DDR bank. The live FDT memory node is
 # <0x80000000 2G>, <0x1_00000000 0xfcc00000>; every fixed reserved-memory
 # carve-out is in the low bank and the dynamic pools are limited below 4G.
-HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0x7e1c0000
+HIGH_PHYS_BASE = 0xa6000000
+HIGH_MEM_SIZE = 0xd81c0000
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 

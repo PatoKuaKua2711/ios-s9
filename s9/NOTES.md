@@ -259,3 +259,13 @@ Reinicia sozinho em ~10-15 s = watchdog (0x17980000, bark 11 s) ou o ABL recusou
   (modem, hyp, IPA 320M+85M, SPSS, fb, debug). Dois buracos livres: R1 [0xa1800000,0xc0000000) 487M e
   R2 [0xd4000000,0xff000000) 688M. 2017+688+487 = ~3,2 GB, mas exige XNU gerenciar um intervalão com 2 carveouts
   reservados (0xc0000000-0xd4000000, 0xff000000-0x100000000). M8 confirma na mão que R1/R2 são RAM livre antes de arriscar.
+
+- **🎉 iOS com ~3,1 GB de RAM (2026-10-24, boot-ios7):** patch **0091** (kernel 10). O XNU exige RAM contígua
+  (vm_page array indexado por `phys_page = base + i`), mas as duas carveouts da Qualcomm (IPA 0xc0000000-0xd4000000,
+  SPSS 0xff000000-0x100000000) ficam no meio do nosso span. Solução: dar ao XNU o span inteiro `[0xa6000000, topo]`
+  (base acima do staging do ABL — abaixo disso o loader recusa: "ramdisk overlaps kernel memory"), manter o array
+  **contíguo** (entregar todas as páginas, assertion passa) e excluir os buracos **só da lista livre** via
+  `pmap_is_bad_ram()` nos pontos de release do `pmap_startup` (mesmo mecanismo das páginas ECC ruins). mkadt:
+  dram-base 0xa6000000, dram-size 0xd80c0000. Resultado medido: **hw.memsize 2016→3456 MiB, 1,43 GB livres**,
+  SpringBoard sobe. Confirmado antes no shim M8 que R1/R2 eram RAM livre. Base NÃO pode ser 0xa1800000 (bate no
+  payload do ABL em ~0xa2000000). Falta: black clamp (próximo build).
