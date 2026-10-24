@@ -1,0 +1,168 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index e6efdb3..de32973 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -629,6 +629,14 @@ sysctl_sweet_gesture SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gesture, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, 0, sysctl_sweet_gesture, "A", "S9: synthetic stroke \"x0 y0 x1 y1 ms\" in panel pixels (ms 0: tap)");
+ 
++/* Galaxy S9 scheduling knobs (osfmk/kern/sched_prim.c), to measure them live. */
++extern uint64_t sweet_fast_map;
++extern int sweet_parallelism;
++SYSCTL_QUAD(_kern, OID_AUTO, sweetfast, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fast_map,
++    "S9: mask of the fast cores (0 = stock scheduling)");
++SYSCTL_INT(_kern, OID_AUTO, sweet_parallelism, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_parallelism, 0,
++    "S9: dispatch_apply width reported for QoS default and above (0 = every core)");
++
+ void
+ sweet_touch_init(void)
+ {
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 953875c..2247eea 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -36,6 +36,7 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <sys/sysctl.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_usb_probe(void);
+@@ -362,6 +363,59 @@ s9_bcm(const char *name)
+ 	return err;
+ }
+ 
++/*
++ * sysctl kern.sweet_mem_vote=V (1..16383): V as both the average and the peak
++ * bandwidth vote of the DDR (BCM MC0) and the system cache (SH0), the bus
++ * votes Linux makes; the always-on processor picks the lowest DDR/LLCC level
++ * that carries them (16383: the highest). Nothing else in this port votes them,
++ * so they stay where ABL left them: 0 (untouched) unless written, and only a
++ * reboot gives ABL's vote back. Needs the RPMh set up by the USB cold start.
++ */
++static int s9_mem_vote;
++
++static int
++s9_bcm_vote(const char *name, uint32_t vote)
++{
++	uint32_t a = 0;
++	uint32_t v = (1u << 30) | (1u << 29) | ((vote & 0x3fffu) << 14) | (vote & 0x3fffu);
++	int err = s9_rpmh_lookup(name, S9_SLAVE_BCM, &a);
++
++	if (!err) {
++		err = s9_rpmh_amc(1, &a, &v);
++	}
++	printf("SWEET USB S9: BCM %s vote 0x%x (0x%x): %d\n", name, vote, a, err);
++	return err;
++}
++
++static int
++sysctl_sweet_mem_vote SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = s9_mem_vote, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 1 || value > 0x3fff) {
++		return EINVAL;
++	}
++	if (s9_tcs == 0 || s9_db == 0) {
++		return ENODEV;
++	}
++	error = s9_bcm_vote("MC0", (uint32_t)value);
++	if (!error) {
++		error = s9_bcm_vote("SH0", (uint32_t)value);
++	}
++	if (!error) {
++		s9_mem_vote = value;
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_mem_vote, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_mem_vote, "I", "S9: DDR + system cache bandwidth vote (0 = as ABL left it)");
++
+ static int
+ s9_smmu_usb(void)
+ {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 252474e..6875c7d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -53,6 +53,14 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern "C" int sweet_bind_current_thread(int cpu);   /* osfmk/kern/sched_prim.c */
++
++/*
++ * Galaxy S9: the framebuffer's own threads (the present work loop: cache
++ * cleans, flips; the vsync timer) run at kernel priority, which the fast-core
++ * scheduling puts on the A75s CoreAnimation renders on: an A55 does them.
++ */
++#define S9_FB_THREAD_CPU        3
+ 
+ /*
+  * Galaxy S9: the S6E3HA8 is a command-mode panel. ABL leaves the pingpong
+@@ -545,6 +553,9 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if (count == 1) {
++		IOLog("SWEET FB: vsync thread on cpu %d\n", sweet_bind_current_thread(S9_FB_THREAD_CPU));
++	}
+ 	fb->countUnderruns();
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+@@ -610,6 +621,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ void
+ AppleCLCD::presentFired(OSObject *owner, __unused IOInterruptEventSource *sender, __unused int count)
+ {
++	static bool bound;
++	if (!bound) {
++		bound = true;
++		IOLog("SWEET FB: present thread on cpu %d\n", sweet_bind_current_thread(S9_FB_THREAD_CPU));
++	}
+ 	((AppleCLCD *)owner)->presentPending();
+ }
+ 
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 361dd13..8bde7fc 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -149,7 +149,17 @@ bool sched_stats_active;
+  * core first and may preempt a background thread there; threads below take
+  * an idle slow core first, keeping the fast ones free.
+  */
+-static cpumap_t sweet_fast_map = 0xf0;
++extern cpumap_t sweet_fast_map;
++extern int sweet_parallelism;
++cpumap_t sweet_fast_map = 0xf0;         /* also sysctl kern.sweetfast (bsd/dev/sweet_touch.c) */
++/*
++ * sysctl kern.sweet_parallelism: libdispatch sizes dispatch_apply by the
++ * parallelism the kernel reports for the caller's QoS. CoreAnimation's CPU
++ * renderer splits every polygon into 4-row chunks with dispatch_apply and waits
++ * for the last one, so with all eight cores an A55 (~3x slower) may hold up
++ * each polygon. N > 0 reports N for QoS default and above (4 = the A75s).
++ */
++int sweet_parallelism;
+ 
+ static inline bool
+ sweet_wants_fast(thread_t thread)
+@@ -8062,6 +8072,12 @@ sched_qos_max_parallelism(__unused int qos, uint64_t options)
+ 	 */
+ 	assert((options & QOS_PARALLELISM_CLUSTER_SHARED_RESOURCE) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (sweet_parallelism > 0 && qos >= THREAD_QOS_LEGACY) {
++		return (uint32_t)sweet_parallelism;
++	}
++#endif
++
+ 	/* Query the machine layer for core information */
+ 	__assert_only kern_return_t kret = host_info(host_self(), HOST_BASIC_INFO,
+ 	    (host_info_t)&hinfo, &count);
