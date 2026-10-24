@@ -168,6 +168,93 @@ Firmware stock: `../ZTO-G9600ZHU9FVF2` (G9600ZHU9FVF2, Android 10).
 - **Controle remoto:** `tools/s9ssh.sh [cmd]`, `tools/s9-twrp.sh` (iOS → TWRP sem botões), `tools/s9-log.py ARQ`
   (log do kernel ao vivo, UDP 5140). boot-ios6 = kernel 8 + boot-args do ios4 + `sweetusb=2 cs_enforcement_disable=1`.
 
+## Auditoria e zero-copy (2026-10-24, noite 2)
+
+**Shim M9 (vídeo do dono, 16:38):** A ok (o SDE lê 0xb0000000: sem bloqueio de SMMU para o display), B ok
+(QSEED3 bilinear 414x1792 -> 720x2960 por metade; a "metade esquerda repetida" foi bug do teste: o ABL aponta o
+VIG1 com o **mesmo endereço** e `SRC_XY x = 0x2D0`, não pelo endereço), C: 31 -> 60/61 quadros enviados/s com
+autorefresh 1 (o contador de TE em PP_INT_COUNT_VAL não anda nesse modo; PP_LINE_COUNT anda). Layout lido do ABL:
+CTL0 top 0x00020020, LM0 layer 0x01000005, LM1 0x01000028, VIG0/VIG1 src 0x0B9002D0 out 0x0B9002D0 addr
+0x9D400000 ystride 0x1680 fmt 0x000237FF op 0x80000000, QSEED3 versão 0x1003.
+
+**Achados confirmados** (evidência = código + logs + desmontagem do dyld cache, `work/dsc`):
+1. Cópia+escala de cada quadro na CPU (SweetFramebuffer.cpp presentScaled): 8,1-8,6 ms/quadro, ~40 MB de memória
+   por quadro (lê 5,9 + escreve 17 + dc cvac 17).
+2. Rasgo: a cópia escreve no buffer que o autorefresh do MDSS está lendo (buffer único, sem sincronia com o TE).
+3. `SwapWait` (sel 6) era no-op. Desmontagem do QuartzCore: `IOMFBDisplay::finish_update` grava em cada buffer o
+   id do swap que o mostra (`SwapBegin(fb, &buf.swap_id)`); `can_update_` chama `SwapWait(fb, outro.swap_id)` antes
+   de redesenhar num buffer. Semântica certa: voltar quando aquele swap estiver **na tela**.
+4. Vsync do kernel nunca usado: seletor 72 ausente nos 5 logs. `CADeviceUseVBL()` só liga para ChipID 0x7000 ou a
+   lista `vbl_chip_ids` (o A11 0x8015 não está); `CA_FORCE_TIMER=1` (env) força use_vbl=1 =
+   `IOMobileFramebufferEnableVSyncNotifications` (sel 72 tipo 5, args count/hosttime/0 = formato do nosso kernel).
+   Sem isso o CA usa `CADisplayTimer` próprio (IOMFBServer::timer_callback), sem fase do painel. O timer do kernel
+   ainda deriva (setTimeoutUS relativo).
+5. Linha "present avg ... fps" dividia por 10.
+6. sweet_usb: thread de eventos consulta a cada 1 ms (1000/s, prioridade de kernel).
+7. sweet_usb: 1 TRB de RX e 1 de TX: ~1 quadro por consulta, ~1,5 MB/s e +1 ms por pacote (lento p/ Safari).
+8. `tools/s9-twrp.sh` não chega ao TWRP (ABL da Samsung lê o BCB na partição misc).
+Menores: SweetHID com canvas fixo 1125x2436 (só borda); comentário velho no 0091 (pmap.c: 0xa1800000); mkadt
+`clock-frequency` 2803/1766 vs 2649/1689 reais; GetBlock 79/SupportedFrameInfo 74/gamma 27/área 29 devolvem zeros.
+Suspeitas: thread que já roda num A55 não migra p/ A75 livre; carveouts no physmap (prefetch especulativo, nunca
+visto); trim parece seguro p/ Safari (falta prova). Conferidos sem bug: 0092 escalonador, touch, AKS, clocks 0089
+(2649 = linha oficial de 4 núcleos), s9net, trim, respring, S9Wallpaper.
+
+**Mapa de seletores do IOMobileFramebuffer** (desmontagem, `kern_*` → IOConnectCall): 3 GetLayerDefaultSurface,
+4 SwapBegin, 5 SwapEnd (struct = fb+0x18, 0x46c; dirty region em +0x250 x,y,w,h, flag +0x260), 6 SwapWait /
+SwapWaitWithTimeout [id, flags, 0], 7 GetID, 8 GetDisplaySize, 12 RequestPowerChange, 15 SetDebugFlags,
+17/27 Set/GetGammaTable (3084 = 257x3x4), 18 IsMainDisplay, 20 SwapSignal, 22 SetDisplayDevice, 28 GetDotPitch,
+29 GetDisplayArea, 33 EnableDisableVideoPowerSavings, 50 SetBrightnessCorrection, 52 SwapCancel, 55 SetMatrix,
+57 GetColorRemapMode, 68 SetParameter, 72 Enable/DisableNotifications, 74 SupportedFrameInfo, 77
+GetCurrentAbsoluteTime, 78/79 Set/GetBlock, 81 SwapCancelAll, 83 CopyLayerDisplayedSurface, 84 SetContrast.
+
+**0096** (CI xnu 40133083582, kernel `../work/s9-kernel-14`, `out/boot-ios12.img` = ADT s9-xr2 + boot-args do ios11):
+- **Zero-copy:** as superfícies de tela do backboardd (canvas, BGRA, sem planos; ids 2/3) vão para 3 "vagas" no
+  fim da região do splash (0x9e500000 + k·0x5b0000, até 0x9f610000; TIMA começa em 0x9f800000), mapeadas com
+  cache. Cada swap: dc cvac só nas linhas que o CA pode ter escrito desde a última vez que aquela vaga apareceu
+  (união dos dirty regions), VIG0/VIG1 SRC0_ADDR = vaga, `SRC_XY` x = 0 / 414, QSEED3 bilinear, flush do CTL0
+  (0x20003): o SDE aplica no início do próximo quadro (sem rasgo). `SwapWait` espera o flush ser aplicado (bits
+  limpos), poll de 0,5 ms, máx. 50 ms. Tela apagada: painel preto e pipes de volta ao layout do ABL.
+- `sysctl kern.sweetfb_zerocopy=0/1` alterna ao vivo (boot-arg `sweetfb_zerocopy=0`); a cópia na CPU agora copia
+  só as linhas sujas e o SwapWait espera a cópia. Contadores: `kern.sweetfb_{swaps,flips,copies,present_ns,
+  waits,wait_ns,wait_timeouts}`.
+- `sysctl kern.sweet_swipe=N`: N arrastos sintéticos sobe/desce no meio da tela (dedo virtual, slot 9 do HID) para
+  medir sem ninguém no aparelho: `tools/s9-bench.sh 0|1 [N]`.
+- Thread de eventos do USB presa na CPU 2 (A55). Bateria: modo reserva anuncia "carregando" (raio na barra; nível
+  não medido: o fuel gauge do S9 é o MAX77705 em I2C).
+- Linha de fps corrigida (3000e9/span), agora com flips/cópias e tempo médio de SwapWait.
+
+**0097** (CI 40136178017, `out/boot-ios13.img`): o `SwapWait` responde na hora às consultas. Desmontagem do
+QuartzCore: `swap_wait_timeout` (modo timer, o nosso) chama `SwapWait` e, se não for 0, dorme 100 us e repete até
+um orçamento de **1 ms** (constante 0.001 em 0x18855cb20); estourou, o CA segue por outro caminho (3º buffer: o
+construtor `AppleDisplay` põe o pool em 3 com page flipping, `+0x360`). Flags com bit 31 = consulta. Também:
+`kern.sweetfb_fullclean` (padrão 1 = dc cvac da vaga inteira, ~0,33 ms; 0 = só linhas sujas), contador de underrun
+(INTR_STATUS 0x1014 bit 26 = INTF_1, limpo em 0x1018: **0 underruns** em todas as medições),
+`kern.sweet_gesture="x0 y0 x1 y1 ms"` (dedo virtual livre, slot 8; ms 0 = toque; desbloqueio = `720 2950 720 1500
+150`), bateria reserva com 500 mA e `AdapterDetails` (5 W, família 0xe000400a). **O raio ainda não apareceu** (0096;
+0097/0098 não confirmados pelo dono).
+
+**0098** (CI 40138341538, `out/boot-ios14.img` = **o que está gravado agora**, cmdline do ios11 + `ufslogsecs=60`):
+`kern.sweet_parallelism` (largura do dispatch_apply para QoS default+; 4 = só A75), `kern.sweetfast` (máscara
+ao vivo), `kern.sweet_mem_vote` (voto de banda DDR MC0 + LLCC SH0 via RPMh; **0 = intocado, NÃO usar sem o ok do
+dono**: ele não quer mais overclock), threads de present e vsync presas na CPU 3 (A55).
+
+**Medido (dedo virtual nos Ajustes, `tools/s9-bench.sh`, 4-6 ciclos):**
+- Apresentação: 8.100-8.600 us/quadro (cópia, 0095) -> **14-350 us** (zero-copy; 0,33 ms com limpeza completa).
+- Rolagem dos Ajustes: **mediana 25 fps, máx. 28-31** em todos os modos: SwapWait bloqueante (0096), consulta
+  (0097), nunca espera; `sweet_parallelism=4` (com e sem reiniciar o backboardd); `CADisableColorMatching=YES`
+  (preferência do backboardd, reiniciado). Uso livre (dono): janelas de 60,2 e 42 fps em alguns trechos, 24-26 no
+  resto. => **o teto é o CoreAnimation desenhando na CPU (~40 ms/quadro)**, não a apresentação.
+- Parado, algo animou a exatos 24,0 fps por > 1 min (região pequena, present 15 us): achar e cortar.
+- Dono relatou falhas "tipo TV de tubo" por frações de segundo no 0096 (limpeza parcial); 0097+ usa limpeza
+  completa (não confirmado pelo dono).
+- Spindump antigo (ios8, outra tela) nas threads do `dispatch_apply`: `memset_pattern16` 17 %, `tex_multiply_color`
+  14 %, `image_sampler` sem filtro 11 % + com filtro 7 %, `vAlpha_Blend` 10 %, `circle_sampler` (cantos contínuos,
+  com powf) alto. O `scan_convert` divide cada polígono em faixas de 4 linhas (dispatch_apply por polígono).
+- **Falta**: spindump da rolagem dos Ajustes (o dono interrompeu duas vezes); medir banda de memória.
+
+Ferramentas novas: `tools/s9-ui.sh` (unlock/tap/swipe/open via dedo virtual), `tools/s9-bench.sh`,
+`tools/s9-tune.sh` (prep/bench/capref/membw), `tools/s9-profile.sh` (spindump + simbolização do backboardd).
+
 ## Handoff (2026-10-24, noite): o que está gravado e funcionando
 
 **Boot atual:** `out/boot-ios11.img` = kernel 0095 (`../work/s9-kernel-13`, CI xnu run 40116531969) + ADT
