@@ -20,6 +20,11 @@ jobs:
           xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -dynamiclib \
             -o out/s9probe.dylib probe.c
           codesign -f -s - out/s9probe.dylib
+          # S9Wallpaper tweak (ElleKit, SpringBoard): static lock/home wallpaper
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -Wall -fobjc-arc -dynamiclib \
+            -framework Foundation -framework UIKit -o out/S9Wallpaper.dylib S9Wallpaper.m
+          codesign -f -s - out/S9Wallpaper.dylib
+          cp S9Wallpaper.plist out/
           for t in s9net; do
             xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -Wall \
               -framework CoreFoundation -framework SystemConfiguration "$t.c" -o "out/$t"
