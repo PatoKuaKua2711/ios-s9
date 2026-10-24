@@ -1,0 +1,1025 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490..7182b44 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -10,6 +10,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
++#include <sys/sysctl.h>
+ #include "sweet_spmi.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -123,4 +124,120 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	IOLockUnlock(sp_lock);
+ 	return -1;
+ }
++/*
++ * Galaxy S9: "reboot into recovery" for remote work over USB (ssh, then
++ * `sysctl -w kern.sweet_next_boot=1; reboot`), so the phone can reach TWRP
++ * without its buttons. Samsung's ABL picks the boot mode from the PMIC's
++ * PON SOFT_RB_SPARE reason (it ignores the IMEM cookie alone, shim M1.1),
++ * written as Linux's msm-poweroff does for "reboot recovery":
++ * qpnp_pon_set_restart_reason(PON_RESTART_REASON_RECOVERY = 1), bits 7:1 on a
++ * gen2 PON (pm8998), plus the IMEM cookie 0x77665502. The one PMIC write
++ * this file makes, through the apps EE's own channel (owner 0 only).
++ * 0 = normal boot, 1 = recovery, 2 = bootloader (download mode on Samsung).
++ */
++#define SP_CHNLS_PA             0x0c600000u
++#define SP_PON_PPID             0x008u          /* SID 0, PON at 0x800 */
++#define SP_PON_SUBTYPE          0x05u
++#define SP_PON_SOFT_RB_SPARE    0x8fu
++#define SP_IMEM_PA              0x146bf000u
++#define SP_IMEM_RESTART_REASON  0x65cu
++
++static int sweet_next_boot;
++
++static int
++sp_pon_read(uint16_t apid, unsigned reg, uint8_t *out)
++{
++	unsigned off = 0x80u * apid;
++
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sp_obs + off) = (1u << 27) | ((reg & 0xffu) << 4);  /* EXT_READL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(sp_obs, off + 0x08u);
++		if (status & 1u) {
++			if (status & 0x0eu) {
++				return -1;
++			}
++			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
++			return 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	return -1;
++}
++
++static int
++sp_pon_set_reason(unsigned reason)
++{
++	uint8_t subtype = 0, spare = 0;
++
++	if (sweet_spmi_init() != 0) {
++		return EIO;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid(SP_PON_PPID);
++	int err = EIO;
++	if (apid == SP_NO_APID || sp_poisoned[apid] || (sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u) != 0) {
++		goto out;
++	}
++	if (sp_pon_read(apid, SP_PON_SUBTYPE, &subtype) || sp_pon_read(apid, SP_PON_SOFT_RB_SPARE, &spare)) {
++		goto out;
++	}
++	/* gen2 PON (subtype 0x08 primary / 0x09 secondary): reason in bits 7:1, else 7:2 */
++	unsigned shift = (subtype == 0x08 || subtype == 0x09) ? 1 : 2;
++	uint8_t keep = (uint8_t)((1u << shift) - 1);
++	uint8_t value = (uint8_t)((spare & keep) | (reason << shift));
++	vm_offset_t chan = ml_io_map(SP_CHNLS_PA + 0x10000u * apid, 0x100);
++	if (!chan) {
++		goto out;
++	}
++	*(volatile uint32_t *)(chan + 0x10u) = value;                                   /* WDATA0 */
++	__asm__ volatile("dsb osh" ::: "memory");
++	*(volatile uint32_t *)(chan + 0x00u) = (0u << 27) | (SP_PON_SOFT_RB_SPARE << 4); /* EXT_WRITEL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(chan, 0x08u);
++		if (status & 1u) {
++			err = (status & 0x0eu) ? EIO : 0;
++			break;
++		}
++		delay(1);
++	}
++	uint8_t check = 0;
++	(void)sp_pon_read(apid, SP_PON_SOFT_RB_SPARE, &check);
++	vm_offset_t imem = ml_io_map(SP_IMEM_PA, 0x1000);
++	if (imem) {
++		*(volatile uint32_t *)(imem + SP_IMEM_RESTART_REASON) = reason ? 0x77665500u | reason : 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++	}
++	printf("SWEET PMIC: next boot reason %u: PON subtype 0x%02x SOFT_RB_SPARE 0x%02x -> 0x%02x (read 0x%02x), err %d\n",
++	    reason, subtype, spare, value, check, err);
++out:
++	IOLockUnlock(sp_lock);
++	return err;
++}
++
++static int
++sysctl_sweet_next_boot SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = sweet_next_boot, changed = 0;
++	int error = sysctl_io_number(req, value, sizeof(value), &value, &changed);
++
++	if (error || !changed) {
++		return error;
++	}
++	if (value < 0 || value > 2) {
++		return EINVAL;
++	}
++	error = sp_pon_set_reason((unsigned)value);
++	if (!error) {
++		sweet_next_boot = value;
++	}
++	return error;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_next_boot, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_next_boot, "I", "S9: 0 normal, 1 recovery, 2 bootloader on the next reboot");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 0ab5605..64c9785 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -50,14 +50,14 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+-} usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
++} usb_cbcr[] = {                        /* Galaxy S9: SDM845 offsets (gcc-sdm845.c) */
++	{ "master", 0x0f00c },
++	{ "sleep", 0x0f010 },
++	{ "utmi", 0x0f014 },
+ 	{ "cfg-noc-axi", 0x0502c },
+ 	{ "aggre-axi", 0x8201c },
+ 	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "clkref", 0x8c008 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+@@ -73,6 +73,593 @@ usb_rd(vm_offset_t base, uint32_t off)
+ 	return v;
+ }
+ 
++/*
++ * Galaxy S9: USB from cold. Samsung's ABL leaves the USB block off (the
++ * Redmi's ABL left it running for fastboot), so with sweetusb=2 this does
++ * what Linux does before the gadget, each step proven on the phone by shim
++ * stage M7 (s9port/shim/m7.c):
++ *   1. RPMh (apps RSC DRV2 0x179e0000): the QUSB2 PHY rails ldoa5 0.8 V,
++ *      ldoa12 1.8 V, ldoa24 3.075 V; bus clock managers on the USB DMA path
++ *      (aggre2 -> system NoC SN11 -> gem NoC SN0), the SMMU TCU's walks (SH3)
++ *      and config ports (SN6, SN12, CN0), voted at their top level so no
++ *      vote ABL left on this DRV is lowered (DDR's MC0/SH0 are left alone).
++ *   2. Apps SMMU behind Qualcomm's hypervisor: only part of it is emulated
++ *      (reading sCR0 hangs) and S2CR BYPASS turns into FAULT; as U-Boot's
++ *      qcom-hyp-smmu.c, stream 0x740 goes to a free context bank set to
++ *      "S1 translate, S2 bypass" with translation off.
++ *   3. GCC (gcc-sdm845.c): usb30_prim GDSC, the controller's block reset
++ *      while its clocks are still off, master RCG 133.33 MHz, branches.
++ *   4. QUSB2 PHY (phy-msm-qusb-v2.c): DT init sequence, PLL lock.
++ *   5. MAX77705 USB switch: Samsung's Linux opens it on every shutdown
++ *      (max77705_muic_shutdown), so after TWRP D+/D- are disconnected;
++ *      close it with USBC opcode CONTROL1_WRITE = COM_USB, bit-banged I2C.
++ * The controller is then set up by sweet_usb_gadget_start, high speed only
++ * (the UTMI clock feeds the absent SS PHY's pipe side, s9_dwc3_global).
++ */
++#define S9_RSC_PA               0x179e0000u
++#define S9_TCS_PA               0x179e0d00u
++#define S9_TCS_SIZE             0x3000u
++#define S9_CMDDB_LOCATOR_PA     0x0c3f000cu
++#define S9_DRV                  2u
++#define S9_ACTIVE_TCS           2u
++#define S9_NORMAL_TCS           8u
++#define S9_TCS_STRIDE           0x2a0u
++#define S9_CMD_STRIDE           0x14u
++#define S9_TCS_IRQ_EN           0x00u
++#define S9_TCS_IRQ_STATUS       0x04u
++#define S9_TCS_IRQ_CLEAR        0x08u
++#define S9_TCS_WAIT             0x10u
++#define S9_TCS_CONTROL          0x14u
++#define S9_TCS_STATUS           0x18u
++#define S9_TCS_ENABLE           0x1cu
++#define S9_CMD_MSGID            0x30u
++#define S9_CMD_ADDR             0x34u
++#define S9_CMD_DATA             0x38u
++#define S9_CMD_STATUS           0x3cu
++#define S9_AMC_EN               (1u << 16)
++#define S9_TRIGGER              (1u << 24)
++#define S9_CMD_DONE             ((1u << 8) | (1u << 16))        /* issued, completed */
++#define S9_WRITE_ACK            (8u | (1u << 8) | (1u << 16))
++#define S9_CMDDB_MAGIC          0x0c0330dbu
++#define S9_CMDDB_HEADER         144u
++#define S9_CMDDB_ENTRY          24u
++#define S9_SLAVE_VRM            4u
++#define S9_SLAVE_BCM            5u
++
++#define S9_SMMU_PA              0x15000000u
++#define S9_SMMU_SIZE            0x80000u
++#define S9_USB_SID              0x740u
++
++#define S9_GCC_BCR_USB30        0x0f000
++#define S9_GCC_RCG_MASTER       0x0f018         /* CMD_RCGR; CFG_RCGR at +4 */
++#define S9_GCC_BCR_QUSB2        0x12000
++#define S9_GCC_TBU1_VOTE        0x7d034
++#define S9_GCC_TBU2_VOTE        0x7d038
++#define S9_AHB2PHY_PA           0x088ee000
++#define S9_QSCRATCH_PA          0x0a6f8800      /* = QSCRATCH_PA below */
++
++#define S9_TLMM_GPIO33_PA       0x03921000      /* north tile, 0x1000 per pin: GPIO33 SDA, GPIO34 SCL */
++#define S9_MAX77705_USBC        0x25
++#define S9_MAX77705_COM_USB     0x09
++
++static const uint16_t s9_qusb2_init[] = {      /* qcom,qusb-phy-init-seq: value, offset */
++	0x23, 0x210, 0x03, 0x04, 0x7c, 0x18c, 0x80, 0x2c, 0x0a, 0x184, 0x19, 0xb4,
++	0x40, 0x194, 0x1b, 0x198, 0x21, 0x214, 0x0e, 0x220, 0x58, 0x224, 0x75, 0x240,
++	0x29, 0x244, 0xca, 0x248, 0x02, 0x24c, 0x03, 0x250, 0x00, 0x23c, 0x22, 0x210,
++};
++
++static vm_offset_t s9_tcs, s9_db, s9_gpio, s9_qs;
++static uint32_t s9_db_size;
++static bool s9_cold;
++
++/* One plain 32-bit load or store per access: the hypervisor emulates the SMMU from the trapped instruction. */
++static inline uint32_t
++s9_rd(vm_offset_t a)
++{
++	uint32_t v;
++	__asm__ volatile ("ldr %w0, [%1]" : "=r"(v) : "r"(a) : "memory");
++	return v;
++}
++
++static inline void
++s9_wr(vm_offset_t a, uint32_t v)
++{
++	__asm__ volatile ("str %w0, [%1]" : : "r"(v), "r"(a) : "memory");
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static bool
++s9_wait(vm_offset_t a, uint32_t mask, uint32_t want, uint32_t timeout_us)
++{
++	for (uint32_t us = 0; us <= timeout_us; us++) {
++		if ((s9_rd(a) & mask) == want) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++s9_set(vm_offset_t a, uint32_t v)
++{
++	s9_wr(a, v);
++	return s9_wait(a, 0xffffffffu, v, 1000);
++}
++
++static int
++s9_rpmh_init(void)
++{
++	vm_offset_t rsc = ml_io_map(S9_RSC_PA, 0x100);
++	vm_offset_t loc = ml_io_map(S9_CMDDB_LOCATOR_PA, 8);
++
++	s9_tcs = ml_io_map(S9_TCS_PA, S9_TCS_SIZE);
++	if (!rsc || !loc || !s9_tcs) {
++		return ENOMEM;
++	}
++	uint32_t id = s9_rd(rsc), config = s9_rd(rsc + 0x0c);
++	unsigned major = (id >> 16) & 0xff, count = (config >> (6 * S9_DRV)) & 0x3f;
++	unsigned ncpt = (config >> 27) & 0x1f;
++	uint32_t pa = s9_rd(loc), size = s9_rd(loc + 4);
++	printf("SWEET USB S9: RSC id 0x%x config 0x%x, %u TCS, %u cmds each, cmd-db 0x%x+0x%x\n",
++	    id, config, count, ncpt, pa, size);
++	if ((major != 1 && major != 2) || count < S9_NORMAL_TCS || count > S9_TCS_SIZE / S9_TCS_STRIDE ||
++	    ncpt < 3 || ncpt > 16 || pa < 0x80000000u || (pa & 3) || size < S9_CMDDB_HEADER || size > 0x100000) {
++		return ENODEV;
++	}
++	s9_db = ml_io_map(pa, size);
++	if (!s9_db) {
++		return ENOMEM;
++	}
++	s9_db_size = size;
++	if (s9_rd(s9_db + 4) != S9_CMDDB_MAGIC || s9_rd(s9_db) != 1 || (s9_rd(s9_db + 140) & 1)) {
++		return ENODEV;
++	}
++	return 0;
++}
++
++static uint16_t
++s9_db16(uint32_t off)
++{
++	return (uint16_t)(s9_rd(s9_db + (off & ~3u)) >> (8u * (off & 3u)));
++}
++
++/* cmd-db: resource name -> RPMh address, exactly one match of the wanted slave type. */
++static int
++s9_rpmh_lookup(const char *name, uint32_t want, uint32_t *addr)
++{
++	uint32_t key[2] = { 0, 0 };
++	unsigned matches = 0;
++
++	for (unsigned i = 0; i < 8 && name[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8 * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8 + 16 * i;
++		unsigned slave = s9_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = S9_CMDDB_HEADER + s9_db16(h + 2);
++		unsigned count = s9_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3) || entries > s9_db_size ||
++		    count * S9_CMDDB_ENTRY > s9_db_size - entries) {
++			return EINVAL;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = entries + S9_CMDDB_ENTRY * j;
++			if (s9_rd(s9_db + e) != key[0] || s9_rd(s9_db + e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t a = s9_rd(s9_db + e + 16);
++			if (slave != want || (a >> 16) != want) {
++				return EINVAL;
++			}
++			*addr = a;
++			matches++;
++		}
++	}
++	return matches == 1 ? 0 : ENOENT;
++}
++
++static bool
++s9_tcs_free(unsigned t)
++{
++	vm_offset_t b = s9_tcs + t * S9_TCS_STRIDE;
++	uint32_t idle = s9_rd(b + S9_TCS_STATUS);
++
++	return idle != 0 && idle != 0xffffffffu && s9_rd(b + S9_TCS_CONTROL) == 0 &&
++	       s9_rd(b + S9_TCS_ENABLE) == 0 && s9_rd(b + S9_TCS_WAIT) == 0 &&
++	       !(s9_rd(s9_tcs + S9_TCS_IRQ_STATUS) & (1u << t));
++}
++
++/* One ACTIVE (AMC) request of n commands; 0 once RPMh acknowledged all of them. */
++static int
++s9_rpmh_amc(unsigned n, const uint32_t *addrs, const uint32_t *vals)
++{
++	int t = -1;
++
++	for (unsigned i = 0; i < S9_ACTIVE_TCS && t < 0; i++) {
++		if (s9_tcs_free(i)) {
++			t = (int)i;
++		}
++	}
++	if (t < 0) {
++		return EBUSY;
++	}
++	vm_offset_t b = s9_tcs + (uint32_t)t * S9_TCS_STRIDE;
++	uint32_t bit = 1u << t, mask = (1u << n) - 1, irq_en = s9_rd(s9_tcs + S9_TCS_IRQ_EN);
++	if (!s9_set(s9_tcs + S9_TCS_IRQ_EN, irq_en & ~bit)) {
++		return EIO;
++	}
++	for (unsigned c = 0; c < n; c++) {
++		vm_offset_t cmd = b + c * S9_CMD_STRIDE;
++		if (!s9_set(cmd + S9_CMD_MSGID, S9_WRITE_ACK) || !s9_set(cmd + S9_CMD_ADDR, addrs[c]) ||
++		    !s9_set(cmd + S9_CMD_DATA, vals[c])) {
++			return EIO;
++		}
++	}
++	if (!s9_set(b + S9_TCS_WAIT, mask) || !s9_set(b + S9_TCS_ENABLE, mask) ||
++	    !s9_set(b + S9_TCS_CONTROL, 0) || !s9_set(b + S9_TCS_CONTROL, S9_AMC_EN)) {
++		return EIO;
++	}
++	s9_wr(b + S9_TCS_CONTROL, S9_AMC_EN | S9_TRIGGER);
++	bool done = false, progress = false;
++	/* A bus clock manager changing a clock can take a while (M7.7: 2 s). */
++	for (uint32_t us = 0; us < 2000000 && !done; us++) {
++		uint32_t irq = s9_rd(s9_tcs + S9_TCS_IRQ_STATUS), idle = s9_rd(b + S9_TCS_STATUS);
++		bool complete = true;
++		for (unsigned c = 0; c < n; c++) {
++			uint32_t st = s9_rd(b + S9_CMD_STATUS + c * S9_CMD_STRIDE);
++			complete &= st != 0xffffffffu && (st & S9_CMD_DONE) == S9_CMD_DONE;
++		}
++		progress |= idle == 0 || !complete;
++		if (idle && idle != 0xffffffffu && ((irq & bit) || progress) && complete) {
++			done = true;
++		} else {
++			delay(1);
++		}
++	}
++	if (!done) {
++		return ETIMEDOUT;       /* the slot stays as it is: never reused this boot */
++	}
++	if (!s9_set(b + S9_TCS_CONTROL, S9_AMC_EN) || !s9_set(b + S9_TCS_CONTROL, 0) ||
++	    !s9_set(b + S9_TCS_ENABLE, 0) || !s9_set(b + S9_TCS_WAIT, 0)) {
++		return EIO;
++	}
++	s9_wr(s9_tcs + S9_TCS_IRQ_CLEAR, bit);
++	(void)s9_set(s9_tcs + S9_TCS_IRQ_EN, (s9_rd(s9_tcs + S9_TCS_IRQ_EN) & ~bit) | (irq_en & bit));
++	return 0;
++}
++
++static int
++s9_vreg(const char *name, uint32_t mv)
++{
++	uint32_t a = 0;
++	int err = s9_rpmh_lookup(name, S9_SLAVE_VRM, &a);
++
++	if (!err) {
++		/* voltage, mode 7 (HPM), enable last */
++		const uint32_t addrs[3] = { a, a + 8, a + 4 }, vals[3] = { mv, 7, 1 };
++		err = s9_rpmh_amc(3, addrs, vals);
++	}
++	printf("SWEET USB S9: %s %u mV (0x%x): %d\n", name, mv, a, err);
++	return err;
++}
++
++static int
++s9_bcm(const char *name)
++{
++	uint32_t a = 0;
++	/* BCM_TCS_CMD: commit, valid, vote_x (ab) and vote_y (ib) at the top */
++	uint32_t v = (1u << 30) | (1u << 29) | (0x3fffu << 14) | 0x3fffu;
++	int err = s9_rpmh_lookup(name, S9_SLAVE_BCM, &a);
++
++	if (!err) {
++		err = s9_rpmh_amc(1, &a, &v);
++	}
++	printf("SWEET USB S9: BCM %s (0x%x): %d\n", name, a, err);
++	return err;
++}
++
++static int
++s9_smmu_usb(void)
++{
++	vm_offset_t smmu = ml_io_map(S9_SMMU_PA, S9_SMMU_SIZE);
++
++	if (!smmu) {
++		return ENOMEM;
++	}
++	uint32_t id0 = s9_rd(smmu + 0x20), id1 = s9_rd(smmu + 0x24);
++	unsigned nsmr = id0 & 0xff, ncb = id1 & 0xff, pgshift = (id1 >> 31) ? 16 : 12;
++	unsigned cbpg = 1u << (((id1 >> 28) & 7) + 1);
++	vm_offset_t gr1 = smmu + (1u << pgshift);
++	if ((((uint64_t)cbpg + ncb) << pgshift) > S9_SMMU_SIZE) {
++		return ENODEV;
++	}
++	for (unsigned n = 0; n < nsmr; n++) {
++		uint32_t smr = s9_rd(smmu + 0x800 + 4 * n);
++		if ((smr & (1u << 31)) && (smr & 0xffff) == S9_USB_SID) {
++			printf("SWEET USB S9: SMMU stream 0x%x already mapped (SMR %u)\n", S9_USB_SID, n);
++			return 0;
++		}
++	}
++	int cb = -1;
++	for (unsigned i = 0; i < ncb && cb < 0; i++) {
++		uint32_t cbar = s9_rd(gr1 + 4 * i), type = (cbar >> 16) & 3, vmid = cbar & 0xff;
++		if (type != 0 && (type != 1 || vmid != 0xff)) {
++			continue;
++		}
++		s9_wr(gr1 + 4 * i, (cbar & ~(3u << 16) & ~0xffu) | (1u << 16));         /* S1 translate, S2 bypass */
++		s9_wr(gr1 + 0x800 + 4 * i, s9_rd(gr1 + 0x800 + 4 * i) | 1u);            /* CBA2R VA64 */
++		cb = (int)i;
++	}
++	if (cb < 0) {
++		return ENOSPC;
++	}
++	vm_offset_t c = smmu + (((vm_offset_t)cbpg + (unsigned)cb) << pgshift);
++	s9_wr(c + 0x20, 0);     /* TTBR0 */
++	s9_wr(c + 0x24, 0);
++	s9_wr(c + 0x28, 0);     /* TTBR1 */
++	s9_wr(c + 0x2c, 0);
++	s9_wr(c + 0x38, 0);     /* MAIR0/1 */
++	s9_wr(c + 0x3c, 0);
++	s9_wr(c + 0x00, (1u << 7) | (1u << 6) | (1u << 5));     /* SCTLR: CFCFG CFIE CFRE, translation off */
++	s9_wr(c + 0x30, 0);     /* TCR */
++	int slot = -1;
++	for (unsigned n = 0; n < nsmr && slot < 0; n++) {
++		if (!(s9_rd(smmu + 0x800 + 4 * n) & (1u << 31))) {
++			slot = (int)n;
++		}
++	}
++	if (slot < 0) {
++		return ENOSPC;
++	}
++	s9_wr(smmu + 0x800 + 4 * (unsigned)slot, (1u << 31) | S9_USB_SID);
++	s9_wr(smmu + 0xc00 + 4 * (unsigned)slot, (uint32_t)cb);       /* type TRANSLATE (BYPASS would become FAULT) */
++	printf("SWEET USB S9: SMMU id0 0x%x id1 0x%x: stream 0x%x -> SMR %d -> context %d, translation off\n",
++	    id0, id1, S9_USB_SID, slot, cb);
++	return 0;
++}
++
++static int
++s9_gcc_usb(vm_offset_t gcc)
++{
++	s9_wr(gcc + GCC_USB30_PRIM_GDSCR, s9_rd(gcc + GCC_USB30_PRIM_GDSCR) & ~1u);     /* SW_COLLAPSE off */
++	if (!s9_wait(gcc + GCC_USB30_PRIM_GDSCR, 1u << 31, 1u << 31, 20000)) {
++		return ETIMEDOUT;
++	}
++	const uint32_t tbu[2] = { S9_GCC_TBU1_VOTE, S9_GCC_TBU2_VOTE };
++	for (unsigned i = 0; i < 2; i++) {
++		s9_wr(gcc + tbu[i], s9_rd(gcc + tbu[i]) & ~1u);
++		(void)s9_wait(gcc + tbu[i], 1u << 31, 1u << 31, 20000);
++	}
++	/* Block reset with the clocks still off (dwc3_msm_link_clk_reset gates them around it). */
++	s9_wr(gcc + S9_GCC_BCR_USB30, 1);
++	delay(1000);
++	s9_wr(gcc + S9_GCC_BCR_USB30, 0);
++	delay(10);
++	/* master RCG: source 1 (GPLL0 main, 600 MHz), divider 4.5 (field 2 * 4.5 - 1) */
++	s9_wr(gcc + S9_GCC_RCG_MASTER + 4, (1u << 8) | 8u);
++	s9_wr(gcc + S9_GCC_RCG_MASTER, s9_rd(gcc + S9_GCC_RCG_MASTER) | 1u);
++	if (!s9_wait(gcc + S9_GCC_RCG_MASTER, 1u, 0, 10000)) {
++		return ETIMEDOUT;
++	}
++	for (unsigned i = 0; i < 6; i++) {      /* master .. ahb2phy */
++		s9_wr(gcc + usb_cbcr[i].off, s9_rd(gcc + usb_cbcr[i].off) | 1u);
++		if (!s9_wait(gcc + usb_cbcr[i].off, CBCR_CLK_OFF, 0, 10000)) {
++			printf("SWEET USB S9: clock %s stays off\n", usb_cbcr[i].name);
++			return ETIMEDOUT;
++		}
++	}
++	return 0;
++}
++
++static int
++s9_qusb2(vm_offset_t gcc)
++{
++	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
++	vm_offset_t ahb2phy = ml_io_map(S9_AHB2PHY_PA, 0x400);
++
++	if (!phy || !ahb2phy) {
++		return ENOMEM;
++	}
++	s9_wr(gcc + S9_GCC_BCR_QUSB2, 1);
++	delay(150);
++	s9_wr(gcc + S9_GCC_BCR_QUSB2, 0);
++	delay(100);
++	s9_wr(ahb2phy + 0x10, 0x11);    /* one read/write wait state, as dwc3-msm */
++	s9_wr(phy + 0x210, s9_rd(phy + 0x210) | 1u);    /* PWR_CTRL1: power down */
++	for (unsigned i = 0; i < sizeof(s9_qusb2_init) / sizeof(s9_qusb2_init[0]); i += 2) {
++		s9_wr(phy + s9_qusb2_init[i + 1], s9_qusb2_init[i]);
++	}
++	s9_wr(phy + 0x210, s9_rd(phy + 0x210) & ~1u);
++	if (!s9_wait(phy + 0x1a0, 1u, 1u, 5000)) {     /* PLL_COMMON_STATUS_ONE: core ready */
++		return ETIMEDOUT;
++	}
++	return 0;
++}
++
++/* ---- MAX77705 USBC, I2C bit-banged on GPIO33/34 (open drain by output enable, ~100 kHz) ---- */
++
++static vm_offset_t
++s9_pin(unsigned pin)
++{
++	return s9_gpio + (pin - 33) * 0x1000;
++}
++
++static unsigned
++s9_level(unsigned pin)
++{
++	return s9_rd(s9_pin(pin) + 4) & 1;
++}
++
++static void
++s9_line(unsigned pin, bool high)
++{
++	s9_wr(s9_pin(pin), high ? 0 : 1u << 9);
++	delay(5);
++}
++
++static bool
++s9_scl_high(void)
++{
++	s9_wr(s9_pin(34), 0);
++	for (unsigned i = 0; !s9_level(34); i++) {      /* clock stretching */
++		if (i > 10000) {
++			return false;
++		}
++		delay(1);
++	}
++	delay(5);
++	return true;
++}
++
++static bool
++s9_i2c_start(void)
++{
++	s9_line(33, true);
++	if (!s9_scl_high()) {
++		return false;
++	}
++	s9_line(33, false);
++	s9_line(34, false);
++	return true;
++}
++
++static void
++s9_i2c_stop(void)
++{
++	s9_line(33, false);
++	(void)s9_scl_high();
++	s9_line(33, true);
++}
++
++/* 0 acknowledged, 1 not, 2 clock stuck */
++static int
++s9_i2c_byte(uint8_t v)
++{
++	for (int i = 7; i >= 0; i--) {
++		s9_line(33, (v >> i) & 1);
++		if (!s9_scl_high()) {
++			return 2;
++		}
++		s9_line(34, false);
++	}
++	s9_line(33, true);
++	if (!s9_scl_high()) {
++		return 2;
++	}
++	int nack = (int)s9_level(33);
++	s9_line(34, false);
++	return nack;
++}
++
++static int
++s9_i2c_write(const uint8_t *buf, unsigned n)
++{
++	int err = 2;
++
++	if (s9_i2c_start()) {
++		err = s9_i2c_byte(S9_MAX77705_USBC << 1);
++		for (unsigned i = 0; i < n && !err; i++) {
++			err = s9_i2c_byte(buf[i]);
++		}
++	}
++	s9_i2c_stop();
++	return err;
++}
++
++static int
++s9_max77705_usb(void)
++{
++	/* opcode write at 0x21 (COMMAND_CONTROL1_WRITE 0x06, COM_USB), end mark 0x41 = 0 */
++	const uint8_t cmd[3] = { 0x21, 0x06, S9_MAX77705_COM_USB }, end[2] = { 0x41, 0x00 };
++
++	s9_gpio = ml_io_map(S9_TLMM_GPIO33_PA, 0x2000);
++	if (!s9_gpio) {
++		return ENOMEM;
++	}
++	s9_wr(s9_pin(33) + 4, 0);       /* output latch 0: the output enable alone pulls low */
++	s9_wr(s9_pin(34) + 4, 0);
++	s9_wr(s9_pin(33), 0);           /* GPIO function, input, no pull */
++	s9_wr(s9_pin(34), 0);
++	delay(20);
++	int err = s9_i2c_write(cmd, 3);
++	if (!err) {
++		err = s9_i2c_write(end, 2);
++	}
++	return err ? EIO : 0;
++}
++
++/* QSCRATCH: the UTMI clock drives the pipe side (no SS PHY), as dwc3-msm POST_RESET for high speed. */
++static void
++s9_utmi_for_pipe(void)
++{
++	if (!s9_qs) {
++		s9_qs = ml_io_map(S9_QSCRATCH_PA, 0x100);
++	}
++	if (!s9_qs) {
++		return;
++	}
++	s9_wr(s9_qs + 0x08, s9_rd(s9_qs + 0x08) | (1u << 8));                  /* PIPE_UTMI_CLK_DIS */
++	delay(5);
++	s9_wr(s9_qs + 0x08, s9_rd(s9_qs + 0x08) | (1u << 0) | (1u << 3));      /* PIPE_UTMI_CLK_SEL, PIPE3_PHYSTATUS_SW */
++	delay(5);
++	s9_wr(s9_qs + 0x08, s9_rd(s9_qs + 0x08) & ~(1u << 8));
++	delay(5);
++}
++
++static bool
++s9_usb_cold_start(vm_offset_t gcc)
++{
++	static const char *const bcms[] = { "SH3", "SN11", "SN0", "SN6", "CN0", "SN12" };
++	int err = s9_rpmh_init();
++
++	if (!err) {
++		err = s9_vreg("ldoa5", 800);
++	}
++	if (!err) {
++		err = s9_vreg("ldoa12", 1800);
++	}
++	if (!err) {
++		err = s9_vreg("ldoa24", 3075);
++	}
++	for (unsigned i = 0; !err && i < sizeof(bcms) / sizeof(bcms[0]); i++) {
++		(void)s9_bcm(bcms[i]);  /* a missing one is logged; the rest still count */
++	}
++	if (!err) {
++		err = s9_smmu_usb();
++	}
++	if (!err) {
++		err = s9_gcc_usb(gcc);
++	}
++	if (!err) {
++		err = s9_qusb2(gcc);
++	}
++	if (!err) {
++		err = s9_max77705_usb();
++	}
++	if (!err) {
++		s9_utmi_for_pipe();
++	}
++	printf("SWEET USB S9: cold start %s (%d)\n", err ? "FAILED" : "done", err);
++	s9_cold = (err == 0);
++	return s9_cold;
++}
++
++/* After the controller's soft reset: device mode, high speed only, 19.2 MHz reference clock. */
++static void
++s9_dwc3_global(vm_offset_t dwc)
++{
++	s9_utmi_for_pipe();
++	s9_wr(dwc + 0xc110, (s9_rd(dwc + 0xc110) & ~(3u << 12)) | (2u << 12) | 1u);    /* GCTL: device, no clock gating */
++	s9_wr(dwc + 0xc2c0, s9_rd(dwc + 0xc2c0) | (1u << 17));                          /* GUSB3PIPECTL: SS PHY absent, suspend */
++	s9_wr(dwc + 0xc12c, (s9_rd(dwc + 0xc12c) & ~(0x3ffu << 22)) | (52u << 22));    /* GUCTL: REFCLKPER 52 ns */
++	s9_wr(dwc + 0xc630, (s9_rd(dwc + 0xc630) & ~(0xffu << 24 | 1u << 23 | 0x3fffu << 8)) |
++	    (12u << 24) | (1u << 31) | (1u << 23) | (200u << 8));                         /* GFLADJ for 19.2 MHz */
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -90,6 +677,9 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: GCC map failed\n");
+ 		return;
+ 	}
++	if (enabled >= 2 && !s9_usb_cold_start(gcc)) {
++		return;
++	}
+ 	gdscr = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
+ 	printf("SWEET USB: GDSC usb30_prim 0x%08x (%s)\n", gdscr, (gdscr & (1u << 31)) ? "on" : "off");
+ 	for (unsigned i = 0; i < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); i++) {
+@@ -229,6 +819,8 @@ static struct {
+ 	uint32_t    events;
+ 	bool        configured;
+ 	uint8_t     data_alt;       /* data interface alternate setting */
++	bool        link_up;        /* reported to configd (KEV_DL_LINK_ON/OFF, SIOCGIFMEDIA) */
++	bool        restart;        /* host reset us while configured: restart the controller */
+ 	/* network */
+ 	ifnet_t     ifp;
+ 	lck_mtx_t  *lock;           /* TX ring and TX endpoint */
+@@ -379,6 +971,7 @@ ud_string(unsigned idx, uint8_t *out)
+ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_link_event(bool up);
++static bool ud_controller_start(void);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -584,6 +1177,7 @@ ud_if_output(ifnet_t ifp, mbuf_t m)
+ static void
+ ud_link_event(bool up)
+ {
++	ud.link_up = up;
+ 	if (ud.ifp != NULL) {
+ 		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
+ 	}
+@@ -601,9 +1195,10 @@ ud_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+ 		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
+ 		int media = IFM_ETHER | IFM_AUTO;
+ 		ifmr->ifm_current = media;
+-		ifmr->ifm_active = ud.configured ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
++		bool active = ud.configured && ud.link_up;
++		ifmr->ifm_active = active ? (IFM_ETHER | IFM_1000_T | IFM_FDX) : media;
+ 		ifmr->ifm_mask = 0;
+-		ifmr->ifm_status = IFM_AVALID | (ud.configured ? IFM_ACTIVE : 0);
++		ifmr->ifm_status = IFM_AVALID | (active ? IFM_ACTIVE : 0);
+ 		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
+ 			ifmr->ifm_count = 1;
+ 			return copyout(&media, list, sizeof(media));
+@@ -712,6 +1307,14 @@ ud_event(uint32_t ev)
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			printf("SWEET USB: bus reset\n");
++			/*
++			 * Galaxy S9: a reset after configuration means the cable was
++			 * plugged again (VBUS is overridden, so unplugging never shows
++			 * as a disconnect). Start over from a clean controller.
++			 */
++			if (ud.configured) {
++				ud.restart = true;
++			}
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -722,6 +1325,15 @@ ud_event(uint32_t ev)
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
+ 			printf("SWEET USB: disconnect\n");
++		} else if (type == 3) { /* link state change: cable out = the bus goes idle (suspend) */
++			uint32_t state = (ev >> 16) & 0xf;
++			if (state == 3 && ud.link_up) {
++				printf("SWEET USB: link suspended (cable out?): ue0 down\n");
++				ud_link_event(false);
++			} else if (state == 0 && !ud.link_up && ud.configured && ud.data_alt == 1) {
++				printf("SWEET USB: link resumed: ue0 up\n");
++				ud_link_event(true);
++			}
+ 		}
+ 		return;
+ 	}
+@@ -775,6 +1387,32 @@ ud_event(uint32_t ev)
+ 	}
+ }
+ 
++/* Re-plugged: drop the old session (frames, endpoints) and enumerate from scratch. */
++static void
++ud_restart(void)
++{
++	ud.restart = false;
++	lck_mtx_lock(ud.lock);
++	ud.configured = false;
++	ud.tx_busy = false;
++	while (ud.txq_count > 0) {
++		mbuf_freem(ud.txq[ud.txq_head]);
++		ud.txq_head = (ud.txq_head + 1) % UD_TXQ;
++		ud.txq_count--;
++	}
++	lck_mtx_unlock(ud.lock);
++	ud.data_alt = 0;
++	if (ud.link_up) {
++		ud_link_event(false);
++	}
++	dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++	for (int i = 0; i < 500 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++		delay(1000);
++	}
++	printf("SWEET USB: restarting the controller after a re-plug\n");
++	(void)ud_controller_start();
++}
++
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -790,8 +1428,15 @@ ud_thread(void *arg __unused, wait_result_t wr __unused)
+ 					printf("SWEET USB: event 0x%08x\n", ev);
+ 				}
+ 				ud_event(ev);
++				if (ud.restart) {
++					break;
++				}
++			}
++			if (ud.restart) {
++				ud_restart();   /* the soft reset also clears the event count */
++			} else {
++				dwc_wr(GEVNTCOUNT, count);
+ 			}
+-			dwc_wr(GEVNTCOUNT, count);
+ 		}
+ 		if ((++ticks % 30000) == 0) {
+ 			printf("SWEET USB: ue0 rx %llu tx %llu frames\n", ud.rx_frames, ud.tx_frames);
+@@ -865,17 +1510,36 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
++	if (!ud_controller_start()) {
++		return;
++	}
++	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++	int livelog = 1;
++	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
++	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
+ 
++/* Soft reset, event buffer, endpoint 0, VBUS override, run. Also used to restart after a re-plug. */
++static bool
++ud_controller_start(void)
++{
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+ 		delay(1000);
+ 	}
++	if (s9_cold && !(dwc_rd(DCTL) & DCTL_CSFTRST)) {
++		s9_dwc3_global(ud.dwc);
++	}
+ 	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+ 	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+-		return;
++		return false;
+ 	}
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+@@ -887,8 +1551,8 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	/* High speed, address 0 */
+ 	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+ 	dwc_wr(DCFG, dcfg | 0);
+-	/* Events: disconnect, USB reset, connect done */
+-	dwc_wr(DEVTEN, 0x7);
++	/* Events: disconnect, USB reset, connect done, link state change */
++	dwc_wr(DEVTEN, 0xf);
+ 
+ 	/* Endpoint 0 OUT/IN: start config, control type, max packet 512 until connect done. */
+ 	if (ud_epcmd(0, DEPCMD_DEPSTARTCFG, 0, 0, 0) ||
+@@ -897,12 +1561,15 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	    ud_epcmd(1, DEPCMD_SETEPCONFIG, (0u << 1) | (512u << 3), (1u << 8) | (1u << 10) | (1u << 25), 0) ||
+ 	    ud_epcmd(1, DEPCMD_SETTRANSFRESOURCE, 1, 0, 0)) {
+ 		printf("SWEET USB: endpoint 0 setup failed\n");
+-		return;
++		return false;
+ 	}
+ 	dwc_wr(DALEPENA, 0x3);
+ 	ud_start_setup();
+ 
+-	vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++	static vm_offset_t qs;  /* mapped once: the controller restarts on every re-plug */
++	if (qs == 0) {
++		qs = ml_io_map(QSCRATCH_PA, 0x100);
++	}
+ 	if (qs != 0) {
+ 		uint32_t hs = usb_rd(qs, QSCRATCH_HS_PHY_CTRL), ss = usb_rd(qs, QSCRATCH_SS_PHY_CTRL);
+ 		printf("SWEET USB: QSCRATCH HS_PHY_CTRL 0x%08x SS_PHY_CTRL 0x%08x GENERAL_CFG 0x%08x\n",
+@@ -919,13 +1586,6 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		delay(1000);
+ 	}
+ 	printf("SWEET USB: running (DSTS 0x%08x after %d ms), DMA at 0x%llx\n", dwc_rd(DSTS), i, ud.dma_pa);
+-	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
+-	}
+-	int livelog = 1;
+-	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+-	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
+-		thread_deallocate(thread);
+-	}
++	return true;
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index cb67b4d..9c824b4 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -359,6 +359,48 @@ static struct mac_policy_conf sweet_sandbox_mac_conf = {
+ 
+ static mac_policy_handle_t sweet_sandbox_mac_handle;
+ 
++/*
++ * Galaxy S9 (jailbreak userland): dyld asks AMFI, through
++ * __mac_syscall("AMFI", 90, {in_flags, out_flags_ptr}), which DYLD_*
++ * variables a process may use (amfi_check_dyld_policy_self). With no policy
++ * of that name the call fails and dyld treats every process as restricted,
++ * so ElleKit's DYLD_INSERT_LIBRARIES (SpringBoard tweaks) is ignored. Answer
++ * it allowing everything, as jailbreaks do; other AMFI calls keep failing
++ * with ENOPOLICY exactly as before.
++ */
++#define SWEET_AMFI_DYLD_POLICY          90
++#define SWEET_AMFI_DYLD_ALLOW_ALL       0xffULL /* every AMFI_DYLD_OUTPUT_* bit, incl. 0x20: a missing inserted library is not fatal */
++
++static int
++sweet_amfi_syscall(__unused struct proc *p, int call, user_addr_t arg)
++{
++	struct {
++		uint64_t in_flags;
++		uint64_t out_flags;     /* user pointer */
++	} args;
++	uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
++
++	if (call != SWEET_AMFI_DYLD_POLICY) {
++		return ENOPOLICY;
++	}
++	if (copyin(arg, &args, sizeof(args)) != 0 || args.out_flags == 0) {
++		return EFAULT;
++	}
++	return copyout(&allow, (user_addr_t)args.out_flags, sizeof(allow));
++}
++
++static const struct mac_policy_ops sweet_amfi_syscall_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_syscall_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET AMFI dyld policy",
++	.mpc_ops = &sweet_amfi_syscall_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_syscall_mac_handle;
++
+ static struct mac_policy_conf sweet_amfi_mac_conf = {
+ 	.mpc_name = "SWEET AMFI",
+ 	.mpc_fullname = "SWEET built-in Mobile File Integrity",
+@@ -376,6 +418,9 @@ sweet_amfi_policy_register(void)
+ 	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
+ 	printf("SWEET AMFI: platform binary policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_syscall_mac_conf, &sweet_amfi_syscall_mac_handle, NULL);
++	printf("SWEET AMFI: dyld policy (allow DYLD_INSERT_LIBRARIES) %s (%d)\n",
++	    error ? "FAILED" : "registered", error);
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
