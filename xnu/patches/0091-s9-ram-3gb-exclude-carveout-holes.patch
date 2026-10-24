@@ -54,7 +54,7 @@ index 00568d3..dc5f1b1 100644
  		*pnum = (ppnum_t)atop(first_avail);
  		first_avail += PAGE_SIZE;
 diff --git a/osfmk/vm/vm_resident.c b/osfmk/vm/vm_resident.c
-index 6394730..14fd711 100644
+index 6394730..35dd256 100644
 --- a/osfmk/vm/vm_resident.c
 +++ b/osfmk/vm/vm_resident.c
 @@ -736,6 +736,10 @@ vm_free_delayed_pages(void)
@@ -84,7 +84,7 @@ index 6394730..14fd711 100644
 -			if (!VMP_ERROR_GET(&vm_pages[--i])) {               /* skip retired pages */
 +			--i;
 +			if (!VMP_ERROR_GET(&vm_pages[i]) &&
-+			    !pmap_is_bad_ram(vm_pages[i].vmp_phys_page)) {    /* skip retired + carveout pages */
++			    !pmap_is_bad_ram(VM_PAGE_GET_PHYS_PAGE(&vm_pages[i]))) {  /* skip retired + carveout */
  				vm_page_release_startup(&vm_pages[i]);
  			}
  		} while (i != 0);
