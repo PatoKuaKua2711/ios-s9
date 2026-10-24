@@ -1,0 +1,77 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index 00568d3..b451ced 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -2568,6 +2568,35 @@ pmap_virtual_region(
+ static unsigned int avail_page_count = 0;
+ static bool need_ram_ranges_init = true;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Galaxy S9: XNU manages the DRAM span [gPhysBase, avail_end) as one block,
++ * but two Qualcomm carveouts sit inside it -- the IPA firmware image and the
++ * SPSS secure region. Exclude their pages from the free list so XNU never
++ * allocates them (the physmap still covers them, unused). These regions were
++ * verified to be unused, writable RAM's *neighbours* by shim M8; the holes
++ * themselves are the fixed reserved-memory ranges of the SDM845/starqlte DT.
++ * gPhysBase is 0xa1800000 (see tools/mkadt.py).
++ */
++static const struct { pmap_paddr_t start, end; } sweet_ram_holes[] = {
++	{ 0xc0000000ULL, 0xd4000000ULL },       /* ipa_fw_ld_region, 320 MiB */
++	{ 0xff000000ULL, 0x100000000ULL },      /* pil_spss_region, 16 MiB */
++};
++#define SWEET_RAM_NHOLES (sizeof(sweet_ram_holes) / sizeof(sweet_ram_holes[0]))
++
++/* Advance pa past a hole it lands in (holes sorted, non-overlapping). */
++static pmap_paddr_t
++sweet_ram_skip(pmap_paddr_t pa)
++{
++	for (unsigned i = 0; i < SWEET_RAM_NHOLES; i++) {
++		if (pa >= sweet_ram_holes[i].start && pa < sweet_ram_holes[i].end) {
++			pa = sweet_ram_holes[i].end;
++		}
++	}
++	return pa;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 
+ /**
+  * Checks to see if a given page is in
+@@ -2599,6 +2628,25 @@ initialize_ram_ranges(void)
+ 	assert(first == (first & ~PAGE_MASK));
+ 	assert(end == (end & ~PAGE_MASK));
+ 	avail_page_count = atop(end - first);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	unsigned int sweet_holed = 0;
++	for (unsigned i = 0; i < SWEET_RAM_NHOLES; i++) {
++		pmap_paddr_t hs = sweet_ram_holes[i].start, he = sweet_ram_holes[i].end;
++		if (hs < first) {
++			hs = first;
++		}
++		if (he > end) {
++			he = end;
++		}
++		if (hs < he) {
++			sweet_holed += (unsigned int)atop(he - hs);
++		}
++	}
++	avail_page_count -= sweet_holed;
++	printf("SWEET RAM: span %llu MiB, %u hole pages excluded, %u pages free (~%llu MiB)\n",
++	    (unsigned long long)((end - first) >> 20), sweet_holed, avail_page_count,
++	    (unsigned long long)(((uint64_t)avail_page_count * PAGE_SIZE) >> 20));
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+ 
+ 	need_ram_ranges_init = false;
+ }
+@@ -2641,7 +2689,9 @@ pmap_next_page(
+ 		initialize_ram_ranges();
+ 	}
+ 
+-
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	first_avail = sweet_ram_skip(first_avail);
++#endif
+ 	if (first_avail != avail_end) {
+ 		*pnum = (ppnum_t)atop(first_avail);
+ 		first_avail += PAGE_SIZE;
