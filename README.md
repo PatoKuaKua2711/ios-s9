@@ -7,21 +7,59 @@
 > palera1n/Procursus bootstrap) is **not redistributed here** — `s9/jailbreak/` downloads
 > it from the official sources with full credit. No Apple binaries are included.
 
+<img src="s9/jailbreak/wallpaper/wallpaper.jpg" width="200" align="right" alt="ios-s9 default wallpaper">
 
-**Work in progress.** A port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) to the
-Snapdragon Galaxy S9 (`starqltechn`, SDM845): Apple's open-source XNU plus the unmodified iPhone X (iPhone10,3)
-iOS 16.7.16 userland, booted bare-metal from Samsung's bootloader. All the hard work below is ios-sweet's; this
-fork adds what differs on the S9:
+A port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) to the Snapdragon Galaxy S9
+(`starqltechn`, SDM845): Apple's open-source XNU plus the **unmodified iPhone X (iPhone10,3) iOS 16.7.16
+userland**, booted bare-metal from Samsung's bootloader. As of **2026-10-24** it boots to a jailbroken,
+tweak-capable home screen with internet over the USB cable.
 
-- `s9/`: bare-metal shim for Samsung ABL (boot.img v0, Image.gz + stock DTBs), flashed with TWRP + dd (Heimdall's
-  retry corrupts flashes on this phone). Milestones so far: framebuffer (the S6E3HA8 is a command-mode panel, but
-  ABL leaves pingpong autorefresh on), 8 cores via PSCI, GICv3 + timer IRQs, UFS read-only probe, 16K MMU.
-  Bring-up log in `s9/NOTES.md`.
-- `xnu/patches/0082-s9-galaxy-s9-bringup.patch`: early console on the S9 splash (0x9d400000, 1440x2960) and the
-  Redmi-only touch / keys / USB drivers off by default.
-- `tools/mkadt.py`: S9 device tree (RAM 0x100000000 + 0x7e1c0000, framebuffer, Kryo 385).
-- `s9/jailbreak/`: turn the booted userland into a usable jailbreak (internet over USB, SSH, ElleKit
-  tweak injection, Sileo, NewTerm). See [s9/jailbreak/README.md](s9/jailbreak/README.md).
+| Area | State on the Galaxy S9 |
+| --- | --- |
+| Boot | Samsung ABL → our shim in the `boot` partition (flashed from TWRP with `dd` + readback) → XNU. A few minutes to the lock screen |
+| CPU | All 8 cores (4× Cortex-A55 + 4× Cortex-A75). UI, render and real-time threads prefer the A75s |
+| RAM | About 3.4 GiB for iOS (the Qualcomm carve-outs inside the range are kept off the free list) |
+| Display | 1440×2960 command-mode AMOLED driven at **60 Hz**. iOS sees an iPhone XR-size screen (828×1792 @2x), rendered by CoreAnimation on the CPU and scaled to the panel. 30+ fps; a stable 60 is the next goal |
+| Touch / buttons | Samsung `sec_ts` touchscreen (I²C bit-bang), power and volume keys |
+| Network | Internet over the USB cable (CDC-ECM; the PC shares its connection), SSH as root |
+| Jailbreak | Procursus rootful bootstrap, ElleKit tweak injection, Sileo with 19 working repos, NewTerm, OpenSSH, PreferenceLoader |
+| Not working | Wi-Fi, Bluetooth, cellular, GPU (there is no iOS driver for the Adreno), camera, sensors. Safari does not load web pages yet, the Photos app and Settings → About do not open, and the home screen wallpaper is black |
+
+### What's new (2026-10-24)
+
+- **60 Hz panel** (`xnu/patches/0095`): Samsung's bootloader leaves the display engine sending a frame on every
+  2nd tearing-effect pulse (30 Hz). With `sweetfb_hz=60` the kernel switches it to every pulse.
+- **iPhone XR-size canvas at @2x** (`s9/tools/mkadt.py --scale2`): 46 % fewer pixels for the CPU renderer than the
+  iPhone X @3x canvas, with the correct status bar. UIKit picks the status bar layout by native pixel width *and*
+  notch size, so 375×812 @2x showed a red "rdar:45025538" bar. The device tree now describes a whole XR screen
+  (828×1792, artwork subtype 1792).
+- **Default wallpaper on the lock screen**: original artwork (`s9/jailbreak/wallpaper/`), drawn by the small
+  `S9Wallpaper` tweak (`s9/ios-tools`). PosterBoard has no poster providers on this root, so the stock lock screen
+  stayed black. Replace `/var/mobile/Library/S9Wallpaper/wallpaper.jpg` and respring to use your own picture.
+- **Tweaks load on every boot**: SpringBoard starts before ElleKit's loader has finished, so the first SpringBoard
+  never had tweaks. The launchd job `com.ios-s9.respring` now resprings once per boot by itself.
+- **Faster and lighter** (`xnu/patches/0092`-`0094`): idle CPU went from 460 % to about 50 %. Fixes: a securityd
+  retry storm, a Bluetooth audio plug-in polling a removed daemon, render and UI threads landing on the slow cores,
+  and the touch polling thread on the fast ones. Also removed: ad daemons, and `driverkitd`, which was
+  killed and respawned every 10 s.
+- **More Sileo repos preinstalled** (`s9/jailbreak/repos.sources`; each one checked to serve a valid index).
+- **Tools**: `s9/tools/s9-cpu.sh` (CPU per process), `spin-sym.py` (symbolicated spindumps), `s9-objc.py` (Frida +
+  ObjC bridge; never attach it to SpringBoard), shim stage **M9** (display-engine zero-copy and hardware-scaler
+  test, plus a frame-rate counter for the 60 Hz switch).
+
+### Try it
+
+You need a Snapdragon Galaxy S9 (SM-G9600) with an unlocked bootloader and TWRP. The install **erases Android's
+`userdata`**. You also need the iPhone X iOS 16.7.16 IPSW, which you download yourself.
+
+1. Build the kernel: run the `xnu` workflow (GitHub Actions) on your fork and download the `xnu-kernel` artifact.
+2. Build the iOS root image: `tools/mkiosroot.sh`, then run `s9/jailbreak/fetch-jailbreak.sh` and
+   `sudo s9/tools/prep-ios6.sh` (set the image paths at its top). Flash it from TWRP with `s9/tools/flash-userdata.sh`.
+3. Build the boot image: `s9/tools/mkadt.py --scale2` (it needs the D22AP device tree from your IPSW), then
+   `s9/tools/mkpayload.py`, then `PAYLOAD=... s9/build.sh m4`. Flash it from TWRP with `s9/tools/flash-twrp.sh`.
+
+The exact boot arguments, every hardware fact and the full bring-up log are in [s9/NOTES.md](s9/NOTES.md)
+(Portuguese). The jailbreak layer is described in [s9/jailbreak/README.md](s9/jailbreak/README.md).
 
 iOS is Apple's and is not distributed here. Credits: ios-sweet (dipa-studio, MIT), Apple's open-source releases,
 blacktop/darwin-xnu-build, the Samsung/LineageOS SDM845 kernel sources for hardware details.

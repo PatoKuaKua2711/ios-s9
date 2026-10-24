@@ -1,0 +1,94 @@
+Types: deb
+URIs: https://repo.chariz.com/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://havoc.app/
+Suites: ./
+Components:
+
+Types: deb
+URIs: http://apt.thebigboss.org/repofiles/cydia/
+Suites: stable
+Components: main
+
+Types: deb
+URIs: https://sparkdev.me/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://repo.packix.com/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://repo.dynastic.co/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://repo.twickd.com/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://repo.getsileo.app/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://repo.co.kr/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://repo.cypwn.xyz/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://opa334.github.io/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://lukezgd.github.io/repo/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://tigisoftware.com/cydia/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://julioverne.github.io/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://ellekit.space/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://poomsmart.github.io/repo/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://cokepokes.github.io/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://repo.theodyssey.dev/
+Suites: ./
+Components:
+
+Types: deb
+URIs: https://repo.palera.in/
+Suites: ./
+Components:

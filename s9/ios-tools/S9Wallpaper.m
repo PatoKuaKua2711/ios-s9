@@ -5,9 +5,9 @@
  * first-boot LaunchServices database has none of the system poster provider
  * plug-ins (they live inside private frameworks), so PosterBoard has nothing
  * to show and both screens stay black. This tweak (ElleKit, SpringBoard only)
- * puts an image on top of SpringBoard's wallpaper window(s) (with no poster
- * only _SBWallpaperSecureWindow exists: the lock screen) and behind the home
- * screen's views (SBHomeScreenWindow), so both screens get the background.
+ * puts an image on top of SpringBoard's wallpaper window(s). With no poster
+ * the only one is _SBWallpaperSecureWindow, so today this is the lock screen
+ * background; the home screen stays black (SBHomeScreenWindow: future work).
  *
  * Defensive by design (a tweak that blocks while SpringBoard loads leaves the
  * phone on the Apple logo): nothing runs in the constructor except one
@@ -41,56 +41,33 @@ static void wlog(NSString *fmt, ...)
 	}
 }
 
-static UIImageView *image_view(CGRect frame)
-{
-	UIImageView *iv = [[UIImageView alloc] initWithImage:gImage];
-	iv.tag = kTag;
-	iv.frame = frame;
-	iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-	iv.contentMode = UIViewContentModeScaleAspectFill;
-	iv.userInteractionEnabled = NO;
-	iv.opaque = YES;
-	return iv;
-}
-
-static NSMutableSet *gSeen;
-
 static void attach(void)
 {
-	if (gSeen == nil)
-		gSeen = [NSMutableSet new];
+	NSUInteger n = 0;
 	for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
 		if (![scene isKindOfClass:UIWindowScene.class])
 			continue;
 		for (UIWindow *w in ((UIWindowScene *)scene).windows) {
-			NSString *cls = NSStringFromClass(w.class);
-			if (![gSeen containsObject:cls]) {
-				[gSeen addObject:cls];
-				UIView *root = w.rootViewController.view;
-				wlog(@"window %@ level %.0f hidden %d root %@ bg %@", cls, w.windowLevel, w.hidden,
-				    NSStringFromClass(w.rootViewController.class), root.backgroundColor);
-			}
+			if ([NSStringFromClass(w.class) rangeOfString:@"Wallpaper"].location == NSNotFound)
+				continue;
 			UIView *v = [w viewWithTag:kTag];
-			if ([cls rangeOfString:@"Wallpaper"].location != NSNotFound) {
-				/* the wallpaper window: on top of its (empty) poster views */
-				if (v == nil) {
-					[w addSubview:image_view(w.bounds)];
-					wlog(@"attached on top of %@", cls);
-				} else if (w.subviews.lastObject != v) {
-					[w bringSubviewToFront:v];
-				}
-			} else if ([cls isEqualToString:@"SBHomeScreenWindow"]) {
-				/* the home screen: behind the icons */
-				UIView *root = w.rootViewController.view;
-				if (root != nil && v == nil) {
-					[root insertSubview:image_view(root.bounds) atIndex:0];
-					wlog(@"attached behind %@ in %@", NSStringFromClass(w.rootViewController.class), cls);
-				} else if (v != nil && v.superview.subviews.firstObject != v) {
-					[v.superview sendSubviewToBack:v];
-				}
+			if (v == nil) {
+				UIImageView *iv = [[UIImageView alloc] initWithImage:gImage];
+				iv.tag = kTag;
+				iv.frame = w.bounds;
+				iv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+				iv.contentMode = UIViewContentModeScaleAspectFill;
+				iv.userInteractionEnabled = NO;
+				iv.opaque = YES;
+				[w addSubview:iv];
+				wlog(@"attached to %@ (level %.0f)", NSStringFromClass(w.class), w.windowLevel);
+				n++;
+			} else if (w.subviews.lastObject != v) {
+				[w bringSubviewToFront:v];
 			}
 		}
 	}
+	(void)n;
 }
 
 static void apply(void)

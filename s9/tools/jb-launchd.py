@@ -12,6 +12,8 @@ so the jobs a jailbreak would load at runtime go into that file:
   com.ios-s9.s9net     publishes the USB Ethernet service (ue0) to configd
   com.openssh.sshd     the openssh-server package's own job (inetd style,
                        ports 22 and 2222)
+  com.ios-s9.respring  one respring per boot once ElleKit's loader is done
+                       (the first SpringBoard starts before injection is up)
 and SpringBoard gets DYLD_INSERT_LIBRARIES=/usr/lib/TweakInject.dylib
 (ElleKit's injector, Taurine style; the kernel's AMFI dyld policy allows it,
 and a missing library is not fatal). Idempotent.
@@ -46,6 +48,15 @@ JOBS = {
         'UserName': 'root',
         'StandardOutPath': '/private/var/ios-s9/ellekit.log',
         'StandardErrorPath': '/private/var/ios-s9/ellekit.log',
+    },
+    '/System/Library/LaunchDaemons/com.ios-s9.respring.plist': {
+        'Label': 'com.ios-s9.respring',
+        'ProgramArguments': ['/bin/sh', '/usr/libexec/ios-s9-respring'],
+        'RunAtLoad': True,
+        'LaunchOnlyOnce': True,
+        'UserName': 'root',
+        'StandardOutPath': '/private/var/ios-s9/respring.log',
+        'StandardErrorPath': '/private/var/ios-s9/respring.log',
     },
     '/System/Library/LaunchDaemons/com.openssh.sshd.plist': {
         'Label': 'com.openssh.sshd',

@@ -7,7 +7,9 @@
 #    takes it down: nothing to run again.
 # 2. Root image v2 = v1 (mkiosroot.sh + sweet-root-tweaks.py) + the Procursus
 #    rootful bootstrap + jb/debs (installed by dpkg on the first boot) +
-#    s9net + root's ssh key + the launchd jobs (tools/jb-launchd.py).
+#    s9net + root's ssh key + the launchd jobs (tools/jb-launchd.py: ElleKit
+#    loader, s9net, sshd, one respring per boot) + the default wallpaper
+#    (S9Wallpaper tweak) + the Sileo repos.
 # Then (as the normal user, phone in TWRP): tools/flash-userdata.sh IMAGE.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -16,6 +18,7 @@ here=$(pwd)
 src=../work/iosroot/ios16-root-v1.img
 dst=../work/iosroot/ios16-root-v2.img
 jb=$here/jb
+[ -d "$jb" ] || jb=$here/jailbreak/jb     # repo layout: s9/jailbreak/fetch-jailbreak.sh fills it
 fsck=$here/toolchain/bin/fsck.hfsplus
 
 (cd "$jb" && sha256sum -c --quiet SHA256SUMS)
@@ -103,19 +106,53 @@ sbreload || killall -9 SpringBoard
 EOF
 chmod 755 "$mnt/usr/libexec/ios-s9-jbsetup"
 
-install -d -m 755 "$mnt/private/etc/apt/sources.list.d"
-cat > "$mnt/private/etc/apt/sources.list.d/ios-s9.sources" <<'EOF'
-Types: deb
-URIs: https://repo.chariz.com/
-Suites: ./
-Components:
-
-Types: deb
-URIs: https://havoc.app/
-Suites: ./
-Components:
-
+# One respring per boot (launchd job com.ios-s9.respring, tools/jb-launchd.py):
+# SpringBoard starts before com.ios-s9.ellekit's loader has set up injection,
+# so the first SpringBoard of every boot has no tweaks.
+cat > "$mnt/usr/libexec/ios-s9-respring" <<'EOF'
+#!/bin/sh
+# Galaxy S9 iOS: one respring per boot (launchd job com.ios-s9.respring).
+# SpringBoard starts before com.ios-s9.ellekit's loader has set up tweak
+# injection, so the first SpringBoard of every boot runs without tweaks.
+# Wait for SpringBoard to be up and the loader to be done, then restart
+# SpringBoard once: the new one gets the tweaks.
+running() { ps -axo comm | grep -q "$1"; }
+i=0
+while [ $i -lt 900 ]; do
+	if running '/SpringBoard$' && ! running 'ellekit/loader$'; then
+		break
+	fi
+	sleep 2
+	i=$((i + 2))
+done
+sleep 20
+echo "$(date) respring after ${i}s"
+killall -9 SpringBoard
 EOF
+chmod 755 "$mnt/usr/libexec/ios-s9-respring"
+
+# Default wallpaper: PosterBoard has no poster providers on this root, so the
+# S9Wallpaper tweak (s9/ios-tools) draws jb/wallpaper.jpg on the lock screen.
+# Into usr/lib/TweakInject directly: /Library/MobileSubstrate/DynamicLibraries
+# is ElleKit's absolute symlink to it, which would resolve on this PC.
+if [ -f "$jb/S9Wallpaper.dylib" ] && [ -f "$jb/wallpaper.jpg" ]; then
+	install -d -m 755 "$mnt/usr/lib/TweakInject"
+	install -m 755 "$jb/S9Wallpaper.dylib" "$mnt/usr/lib/TweakInject/S9Wallpaper.dylib"
+	install -m 644 "$jb/S9Wallpaper.plist" "$mnt/usr/lib/TweakInject/S9Wallpaper.plist"
+	install -d -m 755 -o 501 -g 501 "$mnt/private/var/mobile/Library/S9Wallpaper"
+	install -m 644 -o 501 -g 501 "$jb/wallpaper.jpg" "$mnt/private/var/mobile/Library/S9Wallpaper/wallpaper.jpg"
+else
+	echo "no jb/S9Wallpaper.dylib or jb/wallpaper.jpg: default wallpaper skipped (s9/jailbreak/fetch-jailbreak.sh)"
+fi
+
+install -d -m 755 "$mnt/private/etc/apt/sources.list.d"
+# Sileo/apt repos: each answered with a valid Release + Packages index on
+# 2026-10-24 (jailbreak/repos.sources in the repo, jb/repos.sources locally).
+if [ -f "$here/jailbreak/repos.sources" ]; then
+	install -m 644 "$here/jailbreak/repos.sources" "$mnt/private/etc/apt/sources.list.d/ios-s9.sources"
+else
+	install -m 644 "$jb/repos.sources" "$mnt/private/etc/apt/sources.list.d/ios-s9.sources"
+fi
 
 python3 -I "$here/tools/jb-launchd.py" "$mnt"
 python3 -I "$here/tools/trim-daemons.py" "$mnt/System/Library/xpc/launchd.plist" --apply

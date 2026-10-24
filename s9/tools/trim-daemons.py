@@ -39,6 +39,9 @@ REMOVE = [
  "wifianalytics","mapspushd","navd","itunesstored",
  # App Store ads: promotedcontentd alone ate ~30 % of a core at idle.
  "ap.promotedcontentd","ap.adprivacyd",
+ # DriverKit host (no dexts here): jetsam killed it at its 7 MB limit every
+ # 10 s and launchd respawned it, each time with a JetsamEvent report.
+ "driverkitd",
 ]
 # chronod stays: without it a widget host scene in SpringBoard fails and is
 # re-activated forever (~33 % of a core on the main thread at idle).

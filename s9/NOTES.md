@@ -168,6 +168,64 @@ Firmware stock: `../ZTO-G9600ZHU9FVF2` (G9600ZHU9FVF2, Android 10).
 - **Controle remoto:** `tools/s9ssh.sh [cmd]`, `tools/s9-twrp.sh` (iOS → TWRP sem botões), `tools/s9-log.py ARQ`
   (log do kernel ao vivo, UDP 5140). boot-ios6 = kernel 8 + boot-args do ios4 + `sweetusb=2 cs_enforcement_disable=1`.
 
+## Handoff (2026-10-24, noite): o que está gravado e funcionando
+
+**Boot atual:** `out/boot-ios11.img` = kernel 0095 (`../work/s9-kernel-13`, CI xnu run 40116531969) + ADT
+`out/s9-xr2.adt` (`mkadt.py --scale2`) + cmdline de uso com `sweetfb_hz=60` (resto igual ao boot-ios9). Fica na
+partição boot: do TWRP, `adb reboot` volta ao iOS. **O kernel do TWRP não monta HFS+**: mudança no root só por SSH,
+com o iOS ligado. Release público `s9-2026.10.24` (s9net, S9Wallpaper, wallpaper; sem kernel: o build liga com
+libs do KDK da Apple).
+
+Feito nesta sessão (com evidência):
+1. **Barra de status vermelha "rdar:45025538" corrigida.** UIKit (`+[_UIStatusBarVisualProvider_Split
+   visualProviderSubclassForScreen:]`) escolhe `Split<largura>` comparando a largura nativa em px **e** o notch
+   (`_exclusionArea` × nativeScale/referenceScale, tolerância ~1e-4). O notch vem do SpringBoard
+   (`sb_thisDeviceDisplayShape` ← `SBHScreenTypeForCurrentDevice`: pontos, escala, `artwork-device-subtype`). Não
+   existe Split750. `mkadt.py --scale2` agora = tela de iPhone XR: canvas 828x1792 @2x + `/product`
+   `artwork-device-subtype` 1792 e `artwork-scale-factor` 2. No aparelho: notch {93.5,0,227,32},
+   `_UIStatusBarVisualProvider_Split828`, UIScreen 414x896 @2x. 1,48 Mpx (−46% vs @3x).
+2. **Painel a 60 Hz (0095).** O ABL deixa PP_AUTOREFRESH = 0x80000002 (1 quadro a cada 2 TE). Com `sweetfb_hz>=60`,
+   `s9_panel_autorefresh(1)` grava 0x80000001 nos pingpongs habilitados (0xae71000 + 0x800·i). O dono viu mais de
+   30 fps ("oscila"). Medição em números ainda não feita (linha `present avg ... fps` do kernel). Shim M9 passo C
+   mede quadros enviados/s e TE/s (vídeo do M9 A/B/C não recebido: perguntar).
+3. **Respring automático por boot** (`com.ios-s9.respring` → `/usr/libexec/ios-s9-respring`, `jb-launchd.py`). O
+   loader do ElleKit (`com.ios-s9.ellekit`, LaunchOnlyOnce) termina depois do 1º SpringBoard ("run `launchctl
+   reboot userspace` to load your tweaks" no ellekit.log), então esse SpringBoard nunca tinha tweaks. O job espera
+   o SpringBoard + o fim do loader, mais 20 s, e mata o SpringBoard uma vez. Visto no boot das 11:05 ("respring after 2s").
+4. **Wallpaper.** O PosterBoard não tem provedores (PRSService `fetchExtensionIdentifiers` = vazio, descritores dão
+   erro -2218 do PBFPosterExtensionDataStore). O banco do LaunchServices deste root tinha **1 plugin** só (163 apps):
+   os .appex dentro de frameworks nunca foram registrados. `uicache -p X.app` registra plugins de app (o LegacyPoster
+   entrou); `-[LSApplicationWorkspace registerPlugin:]` para appex de framework **trava o lsd** (tentado no
+   SpringBoard e no installd; num boot os apps pararam de abrir). Solução: tweak **S9Wallpaper** (s9/ios-tools, CI
+   s9-ios-tools), que põe `/var/mobile/Library/S9Wallpaper/wallpaper.jpg` por cima da `_SBWallpaperSecureWindow`
+   (nível 1035; a única janela de wallpaper sem pôster = tela de bloqueio). É defensivo: nada de UIKit antes de
+   UIApplicationDidFinishLaunching, decodifica fora da main thread, arquivo `disabled` desliga, `log.txt`.
+   **Tela inicial continua preta**: a v3 (imagem atrás do `SBHomeScreenWindow` + log de todas as janelas, commit
+   c891b06) NÃO foi testada; o release usa a v2.
+   No aparelho do dono a imagem é a dele (parece o wallpaper do iOS 15 da Apple; fica fora do git). O repo leva uma
+   arte original (`s9/jailbreak/wallpaper/make-wallpaper.py`).
+5. **driverkitd removido** (trim): o jetsam o matava no limite de 7 MB a cada 10 s e o launchd o recriava, sempre
+   com JetsamEvent + ReportCrash + osanalyticshelper.
+6. **Sileo:** as fontes ficam em `/etc/apt/sources.list.d/` (`sileo.sources` é o que o app edita). 19 repos com
+   Release + Packages válidos em `s9/jailbreak/repos.sources` (13 adicionados ao aparelho do dono).
+7. **Frida 17** funciona (`tools/s9-frida-up.sh`: frida-server `-l 0.0.0.0`; `tools/s9-objc.py`: bridge ObjC
+   minificado com terser, porque mensagens acima de ~128 KB derrubam a conexão). Mas o **attach no SpringBoard travou
+   várias vezes**. Não usar no SpringBoard.
+8. Reduzir Transparência e Reduzir Movimento já estavam ligados (com.apple.Accessibility).
+
+Armadilhas novas:
+- **Nunca sobrescrever um dylib que o SpringBoard tem mapeado** (scp por cima, mesmo inode). O SpringBoard seguinte
+  carrega com a assinatura velha em cache, vira CS_INVALID e perde os entitlements. Aí o `+[SpringBoardUI load]`
+  (`BSSelfTaskHasEntitlement`) aborta no dyld: 2 crashes e o ElleKit entra em safe mode. Instalar em arquivo novo
+  (`/var/root/x.new`, rm, mv).
+- Um SpringBoard ficou parado na tela da maçã depois de um respring (0,43 s de CPU; Frida e spindump travavam ao
+  inspecioná-lo, o que indica processo preso dentro do dyld). Causa não confirmada (reboot forçado pelo dono).
+  Não voltou com o tweak defensivo.
+
+Pendências (ordem do dono): 60 fps estáveis por aceleração (não overclock), otimizar sem debloat, Safari fazer uma
+pesquisa no Google, wallpaper na tela inicial, aba "Sobre" dos Ajustes, app Fotos (photolibraryd/assetsd cortados).
+Prompt da próxima sessão: `PROMPT-proxima-sessao.md`.
+
 ## Mapa de gargalos de fluidez (2026-10-24, medido com spindump + tools/s9-cpu.sh)
 
 Ferramentas novas: `tools/s9-cpu.sh N` (CPU por processo em N s, o iOS não tem top), `spindump` (existe no

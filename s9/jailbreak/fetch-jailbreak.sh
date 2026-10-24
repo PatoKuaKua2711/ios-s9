@@ -23,9 +23,21 @@ for p in openssh-client openssh-server openssh-sftp-server; do
   dl "https://apt.procurs.us/pool/main/iphoneos-arm64/1700/openssh/${p}_9.7p1-1_iphoneos-arm.deb" "5-${p}.deb"
 done
 
+echo "== ios-s9's own iOS pieces (this repo's release; source in s9/ios-tools) =="
+REL=${S9_RELEASE:-https://github.com/syncmodz/ios-s9/releases/download/s9-2026.10.24}
+for f in s9net S9Wallpaper.dylib S9Wallpaper.plist; do
+  echo "  $f"; curl -fsSL -o "jb/$f" "$REL/$f"
+done
+chmod 755 jb/s9net
+# default wallpaper (original artwork, wallpaper/make-wallpaper.py)
+cp wallpaper/wallpaper.jpg jb/wallpaper.jpg
+
 echo "== your SSH key (for root@192.168.7.2 over the USB cable) =="
 [ -f jb/authorized_keys ] || cp "${HOME}/.ssh/ios-s9.pub" jb/authorized_keys 2>/dev/null || \
   echo "  (put your public key at jb/authorized_keys)"
+
+# tools/prep-ios6.sh checks what was fetched against this list
+(cd jb && find . -type f ! -name SHA256SUMS ! -name authorized_keys | sort | xargs sha256sum > SHA256SUMS)
 
 echo "done. PreferenceLoader and other tweak deps are installed on-device via apt"
 echo "(BigBoss/Procursus repos), so tweaks resolve their dependencies by themselves."
