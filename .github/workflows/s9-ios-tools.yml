@@ -1,0 +1,29 @@
+name: s9-ios-tools
+# Small iOS userland tools for the Galaxy S9 root image, built with Xcode's iOS SDK.
+on:
+  push:
+    paths:
+      - 's9/ios-tools/**'
+      - '.github/workflows/s9-ios-tools.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and sign
+        run: |
+          cd s9/ios-tools
+          mkdir -p out
+          for t in s9net; do
+            xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -Wall \
+              -framework CoreFoundation -framework SystemConfiguration "$t.c" -o "out/$t"
+            codesign -f -s - --entitlements "$t.entitlements" "out/$t"
+            codesign -d --entitlements - "out/$t"
+          done
+          shasum -a 256 out/* > out/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s9-ios-tools
+          path: s9/ios-tools/out/
