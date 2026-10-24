@@ -1,5 +1,13 @@
 # ios-s9: iOS 16 on the Samsung Galaxy S9 (SM-G9600)
 
+> ⚠️ **AI-made fork.** This entire Galaxy S9 port — shim, XNU patches, drivers and the
+> jailbreak layer — was built by a human directing an AI (Claude, Anthropic) on real
+> hardware. Hobby research, provided as-is. It stands on other people's work: see
+> [CREDITS.md](CREDITS.md). The jailbreak userland (Sileo, NewTerm, ElleKit, the
+> palera1n/Procursus bootstrap) is **not redistributed here** — `s9/jailbreak/` downloads
+> it from the official sources with full credit. No Apple binaries are included.
+
+
 **Work in progress.** A port of [dipa-studio/ios-sweet](https://github.com/dipa-studio/ios-sweet) to the
 Snapdragon Galaxy S9 (`starqltechn`, SDM845): Apple's open-source XNU plus the unmodified iPhone X (iPhone10,3)
 iOS 16.7.16 userland, booted bare-metal from Samsung's bootloader. All the hard work below is ios-sweet's; this
@@ -12,6 +20,8 @@ fork adds what differs on the S9:
 - `xnu/patches/0082-s9-galaxy-s9-bringup.patch`: early console on the S9 splash (0x9d400000, 1440x2960) and the
   Redmi-only touch / keys / USB drivers off by default.
 - `tools/mkadt.py`: S9 device tree (RAM 0x100000000 + 0x7e1c0000, framebuffer, Kryo 385).
+- `s9/jailbreak/`: turn the booted userland into a usable jailbreak (internet over USB, SSH, ElleKit
+  tweak injection, Sileo, NewTerm). See [s9/jailbreak/README.md](s9/jailbreak/README.md).
 
 iOS is Apple's and is not distributed here. Credits: ios-sweet (dipa-studio, MIT), Apple's open-source releases,
 blacktop/darwin-xnu-build, the Samsung/LineageOS SDM845 kernel sources for hardware details.

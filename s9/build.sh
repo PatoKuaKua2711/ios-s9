@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the S9 shim and wrap it the way Samsung's ABL expects the stock
 # kernel: boot.img header v0, Image.gz with the stock DTBs appended.
-#   ./build.sh [m1|m2|m3|m5] stage to build (default m2)
+#   ./build.sh [m1|m2|m3|m5|m6] stage to build (default m2)
 #   PAYLOAD=out/payload.bin ./build.sh m4   XNU payload as the ramdisk
 #   out/boot.img      -> tools/flash-twrp.sh (verified dd), also kept as out/boot-STAGE.img
 #   out/boot.tar.md5  -> Odin, AP slot
@@ -26,9 +26,12 @@ m1) main="m1.c screen.c" ;;
 m2) main="m2.c con.c" ;;
 m3) main="m3.c con.c plat.c ufs.c mmu.c" ;;
 m5) main="m5.c con.c plat.c" ;;
+m6) main="m6.c con.c plat.c mmu.c" ;;
+m7) main="m7.c con.c plat.c" ;;
+m8) main="m8.c con.c plat.c" ;;
 m4) main="m4.c con.c plat.c loader.c"
     [ -f "${PAYLOAD:-}" ] || { echo "m4 needs PAYLOAD=path/to/payload.bin (tools/mkpayload.py)" >&2; exit 2; } ;;
-*) echo "usage: build.sh [m1|m2|m3|m4|m5]" >&2; exit 2 ;;
+*) echo "usage: build.sh [m1|m2|m3|m4|m5|m6|m7|m8]" >&2; exit 2 ;;
 esac
 
 mkdir -p out/obj

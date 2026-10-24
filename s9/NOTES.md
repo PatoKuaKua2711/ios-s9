@@ -126,6 +126,48 @@ Firmware stock: `../ZTO-G9600ZHU9FVF2` (G9600ZHU9FVF2, Android 10).
   `PAYLOAD=out/payload-ios4.bin ./build.sh m4` (o kernel do CI vai em `../work/s9-kernel-6`).
   **Problemas vistos:** interface lenta (render só na CPU, sem GPU) e apagar a tela pelo power demora muito.
 
+- **M6 (fluidez, 2026-10-23)** `./build.sh m6` (sha 98539530...): nada no XNU/sweet ajusta o clock das CPUs
+  (ficam no que o ABL deixou). M6 lê as tabelas do OSM v2 (L3 0x17d41000, prata 0x17d43000, ouro 0x17d45800;
+  FREQ_REG 0x110+32*i, PSTATE 0x700, DESIRED 0x920+4*core), mede MHz (cadeia de adds x contador) na CPU0 e
+  na CPU4, cópia 4 MB e escrita/leitura do framebuffer NC; depois sobe (L3 <= 1478, prata <= 1689 sem voto MX,
+  ouro no máximo com 4 núcleos) e mede de novo. start.S: `adr` -> `adrp+add` (buffers de 8 MB na .bss).
+  Gravado com readback ok; aguardando a foto.
+
+- **M6 resultado:** ABL deixa o ouro em 825 MHz (linha 0) e o prata em 1612; com OSM: ouro 2706 MHz medido.
+  Framebuffer write-combined: 200 MB/s escrita, 22 MB/s leitura (85 ms/quadro). **0089** (boot-ios5): clocks no
+  SweetCPU (ouro 2649, prata 1689, L3 1478; `sweetcpu=0`, `sweetcpu_mhz=N`) + painel com cache e `dc cvac` por
+  quadro (`sweetfb_wc=1` volta). Dono: "mais fluido do que eu esperava".
+- **🎉 USB DO ZERO (shim M7.11, 2026-10-23):** o PC enumerou "Galaxy S9 iOS (USB Ethernet)". Receita (cada passo
+  provado no M7.x, ver shim/m7.c):
+  1. RPMh DRV2 (RSC 0x179e0000, TCS +0xd00, layout igual ao sweet): ldoa5 800 mV, ldoa12 1800, ldoa24 3075 (VRM:
+     tensão, modo 7, enable). BCMs (cmd-db slave 5): SH3 SN11 SN0 SN6 CN0 SN12 — AMC de BCM pode levar >100 ms
+     (timeout de 2 s; antes falhavam em cascata). No kernel o voto é 0x3fff (nunca rebaixa); MC0/SH0 intocados.
+  2. **SMMU atrás do hypervisor**: ler sCR0 TRAVA; só ID0/ID1/SMR/S2CR/CBAR são emulados. Receita do U-Boot
+     qcom-hyp-smmu.c: contexto livre como S1-translate/S2-bypass com tradução desligada + SMR 0x740 → S2CR TRANSLATE
+     (BYPASS vira FAULT). Sem isso o 1º DMA (TRB) trava a CPU — era também o problema do GPI do touch.
+  3. GCC: GDSC 0xf004; BCR 0xf000 com os clocks DESLIGADOS (com clocks ligados a 1ª leitura do DWC3 trava);
+     RCG 0xf018 cfg 0x108 (133 MHz); CBCR master 0xf00c, sleep 0xf010, utmi 0xf014, cfg-noc 0x502c, aggre 0x8201c,
+     ahb2phy 0x6a004 (offsets do sweet/SM7150 são outros).
+  4. QUSB2: BCR 0x12000, ahb2phy 0x88ee010=0x11, init-seq do DT, PLL 0x1a0 bit0.
+  5. **MAX77705**: o Linux da Samsung ABRE a chave D+/D− em todo shutdown (max77705_muic_shutdown → com_to_open),
+     então depois do TWRP os fios ficam desligados. I²C bit-bang GPIO33 (SDA)/GPIO34 (SCL), slave 0x25: escrever
+     [0x21, 0x06 (CONTROL1_WRITE), 0x09 (COM_USB)] e [0x41, 0x00].
+  6. DWC3: QSCRATCH GENERAL_CFG PIPE_UTMI_CLK_SEL|PIPE3_PHYSTATUS_SW (sem PHY SS), GCTL device + DSBLCLKGTNG,
+     GUSB3PIPECTL SUSPHY, GUCTL/GFLADJ p/ 19,2 MHz; VBUS por override no QSCRATCH.
+- **0090** (CI 40054981141, kernel `../work/s9-kernel-8`): a receita acima no sweet_usb.c (`sweetusb=2`), replug
+  (reset depois de configurado → reinicia o controlador; link cai quando o barramento suspende = cabo fora),
+  política "AMFI" do dyld (__mac_syscall 90 → 0xff: DYLD_INSERT_LIBRARIES liberado) e `sysctl kern.sweet_next_boot`
+  (1 = recovery: PON SOFT_RB_SPARE 0x88F bits 7:1 via canal SPMI 0xc600000+0x10000*APID + cookie IMEM).
+- **Root v2** (`tools/prep-ios6.sh`, sudo): v1 + bootstrap Procursus rootful (palera1n bootstrap-1800) + jb/debs
+  (ElleKit 1.2, Sileo 2.5.1, NewTerm 3, OpenSSH 9.7, network-cmds) instalados no 1º boot pelo job
+  com.ios-s9.jbsetup (log /var/ios-s9/jbsetup.log), s9net (s9/ios-tools no fork, CI s9-ios-tools: publica
+  IPv4/DNS do ue0 no configd), sshd inetd (22/2222, chave ~/.ssh/ios-s9 do PC p/ root), SpringBoard com
+  DYLD_INSERT_LIBRARIES=/usr/lib/TweakInject.dylib (ElleKit estilo Taurine; /.installed_taurine pula o loader).
+  Substitute não existe p/ iOS 16 e conflita com o ElleKit. Senha mobile/root: alpine.
+  PC: perfil NetworkManager `s9-usb` (MAC 02:00:5e:77:ee:01, 192.168.7.1) + dispatcher NAT 90-ios-s9-share.
+- **Controle remoto:** `tools/s9ssh.sh [cmd]`, `tools/s9-twrp.sh` (iOS → TWRP sem botões), `tools/s9-log.py ARQ`
+  (log do kernel ao vivo, UDP 5140). boot-ios6 = kernel 8 + boot-args do ios4 + `sweetusb=2 cs_enforcement_disable=1`.
+
 ## Próximos passos (para a próxima conversa)
 
 1. **Fluidez** (pedido do dono depois do vídeo). Não existe driver iOS pra Adreno: o render continua na CPU.
@@ -200,3 +242,20 @@ da Apple). Avaliação honesta de cada item:
 Leitura do resultado: tela mudou e o TEMPO anda = OK. Tela não mudou mas desligou em ~1 min = shim rodou, kick não funcionou.
 Ficou preso no logo pra sempre = travou cedo (ex.: leitura de registrador) ou o ABL não aceitou a imagem.
 Reinicia sozinho em ~10-15 s = watchdog (0x17980000, bark 11 s) ou o ABL recusou. Tela azul "PANICO" = exceção (foto!).
+
+- **🎉 CAUSA RAIZ do "jailbreak quebrado" = falta de RAM, não trust/rede (2026-10-24):** Sileo não instalava
+  ("restart Sileo"), NewTerm morria ("session finalized"), Safari não abria página. Diagnóstico: os crashes eram
+  quase todos **JetsamEvent** (matador por pressão de memória), um a cada ~10 s. Com 2 GB e ~28 MB livres, o jetsam
+  matava Sileo/NewTerm/WebContent ao nascer. `su mobile -c id` funciona (não é AMFI/trust). Fix: **remover 82 daemons
+  inúteis** (sem cellular/conta/sensor/BT/Wi-Fi/GPU: vmd, locationd, cloud*, homed, health*, spotlight/search, siri*,
+  identityservices, callservices, bluetoothd, fairplayd, etc.) do `/System/Library/xpc/launchd.plist`, protegendo a
+  infra (SpringBoard, backboardd, mediaserverd, lsd, installd, container/usermanager, runningboard, ssh, trustd,
+  amfid, nossos jobs). `tools/trim-daemons.py PLIST --apply` (ligado no `prep-ios6.sh`; aplicado ao vivo + reboot,
+  backup em `launchd.plist.orig`). **Resultado: 28 MB → 163 MB livres, 533→451 daemons, processo de 15 s sobrevive,
+  jetsam parou.** A internet dos apps já vinha OK com o s9net v3 (reachability=1; publicar o serviço SEM forçar a
+  primária — forçar derrubava o SpringBoard por watchdog). Falta o dono confirmar Sileo/NewTerm/Safari na tela.
+- **RAM: alvo 3,2 GB** (teste shim M8 pronto, `./build.sh m8`). Hoje o iOS vê só 2 GB (bloco contíguo de cima,
+  0x100000000+0x7e1c0000). Os 4 GB físicos (0x80000000+0xfe1c0000) têm a metade de baixo esburacada de carveouts
+  (modem, hyp, IPA 320M+85M, SPSS, fb, debug). Dois buracos livres: R1 [0xa1800000,0xc0000000) 487M e
+  R2 [0xd4000000,0xff000000) 688M. 2017+688+487 = ~3,2 GB, mas exige XNU gerenciar um intervalão com 2 carveouts
+  reservados (0xc0000000-0xd4000000, 0xff000000-0x100000000). M8 confirma na mão que R1/R2 são RAM livre antes de arriscar.
