@@ -9,43 +9,41 @@
  * below every other window, so it is the background of the lock screen, the
  * home screen and the app switcher.
  *
+ * Defensive by design (a tweak that blocks while SpringBoard loads leaves the
+ * phone on the Apple logo): nothing runs in the constructor except one
+ * notification observer; all UIKit work waits until SpringBoard has finished
+ * launching, the JPEG is decoded off the main thread, and the file
+ * /var/mobile/Library/S9Wallpaper/disabled turns the tweak off.
+ *
  * The image is /var/mobile/Library/S9Wallpaper/wallpaper.jpg (replace it and
  * respring). It is decoded once into an opaque bitmap of exactly the screen's
  * pixel size, so CoreAnimation's CPU renderer copies it 1:1 (no scaling, no
- * blending) and skips whatever is below it.
+ * blending) and skips whatever is below it. What it did goes to log.txt there.
  */
 #import <UIKit/UIKit.h>
+#include <unistd.h>
 
-static NSString *const kPath = @"/var/mobile/Library/S9Wallpaper/wallpaper.jpg";
+#define DIR		"/var/mobile/Library/S9Wallpaper/"
 static const NSInteger kTag = 0x53395750;	/* 'S9WP' */
 static UIImage *gImage;
+static BOOL gLoading;
 
-static UIImage *load_image(void)
+static void wlog(NSString *fmt, ...)
 {
-	UIImage *src = [UIImage imageWithContentsOfFile:kPath];
-	if (src == nil)
-		return nil;
-	UIScreen *screen = UIScreen.mainScreen;
-	CGSize pts = screen.bounds.size;
-	UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
-	fmt.scale = screen.scale;
-	fmt.opaque = YES;
-	UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:pts format:fmt];
-	return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-		/* aspect fill, centered */
-		CGSize s = src.size;
-		CGFloat k = MAX(pts.width / s.width, pts.height / s.height);
-		CGSize d = CGSizeMake(s.width * k, s.height * k);
-		[src drawInRect:CGRectMake((pts.width - d.width) / 2, (pts.height - d.height) / 2, d.width, d.height)];
-	}];
+	va_list ap;
+	va_start(ap, fmt);
+	NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+	va_end(ap);
+	FILE *f = fopen(DIR "log.txt", "a");
+	if (f != NULL) {
+		fprintf(f, "%s\n", s.UTF8String);
+		fclose(f);
+	}
 }
 
-static void apply(void)
+static void attach(void)
 {
-	if (gImage == nil)
-		gImage = load_image();
-	if (gImage == nil)
-		return;
+	NSUInteger n = 0;
 	for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
 		if (![scene isKindOfClass:UIWindowScene.class])
 			continue;
@@ -61,22 +59,77 @@ static void apply(void)
 				iv.contentMode = UIViewContentModeScaleAspectFill;
 				iv.userInteractionEnabled = NO;
 				iv.opaque = YES;
-				iv.layer.contentsScale = UIScreen.mainScreen.scale;
 				[w addSubview:iv];
-				NSLog(@"S9Wallpaper: on %@", NSStringFromClass(w.class));
+				wlog(@"attached to %@ (level %.0f)", NSStringFromClass(w.class), w.windowLevel);
+				n++;
 			} else if (w.subviews.lastObject != v) {
 				[w bringSubviewToFront:v];
 			}
 		}
 	}
+	(void)n;
+}
+
+static void apply(void)
+{
+	if (UIApplication.sharedApplication == nil)
+		return;
+	if (gImage != nil) {
+		attach();
+		return;
+	}
+	if (gLoading)
+		return;
+	gLoading = YES;
+	UIScreen *screen = UIScreen.mainScreen;
+	CGSize pts = screen.bounds.size;
+	CGFloat scale = screen.scale;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+		UIImage *src = [UIImage imageWithContentsOfFile:@DIR "wallpaper.jpg"];
+		UIImage *img = nil;
+		if (src != nil) {
+			UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat new];
+			fmt.scale = scale;
+			fmt.opaque = YES;
+			UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:pts format:fmt];
+			img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+				/* aspect fill, centered */
+				CGSize s = src.size;
+				CGFloat k = MAX(pts.width / s.width, pts.height / s.height);
+				CGSize d = CGSizeMake(s.width * k, s.height * k);
+				[src drawInRect:CGRectMake((pts.width - d.width) / 2, (pts.height - d.height) / 2, d.width, d.height)];
+			}];
+		}
+		dispatch_async(dispatch_get_main_queue(), ^{
+			gLoading = NO;
+			if (img == nil) {
+				wlog(@"no image at " DIR "wallpaper.jpg");
+				return;
+			}
+			gImage = img;
+			wlog(@"image %.0fx%.0f @%.0fx", pts.width, pts.height, scale);
+			attach();
+		});
+	});
+}
+
+static void apply_after(double seconds)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(seconds * NSEC_PER_SEC)),
+	    dispatch_get_main_queue(), ^{ apply(); });
 }
 
 __attribute__((constructor)) static void init(void)
 {
-	/* New windows (the lock screen's, after a respring...) and late subviews. */
-	[NSNotificationCenter.defaultCenter addObserverForName:UIWindowDidBecomeVisibleNotification
-	    object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { apply(); }];
-	for (double t = 1; t <= 64; t *= 2)
-		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t * NSEC_PER_SEC)),
-		    dispatch_get_main_queue(), ^{ apply(); });
+	if (access(DIR "disabled", F_OK) == 0)
+		return;
+	/* String names: no UIKit symbol is touched while SpringBoard is loading. */
+	[NSNotificationCenter.defaultCenter addObserverForName:@"UIApplicationDidFinishLaunchingNotification"
+	    object:nil queue:nil usingBlock:^(NSNotification *n) {
+		wlog(@"SpringBoard pid %d finished launching", getpid());
+		[NSNotificationCenter.defaultCenter addObserverForName:@"UIWindowDidBecomeVisibleNotification"
+		    object:nil queue:nil usingBlock:^(NSNotification *m) { apply_after(0.5); }];
+		for (double t = 2; t <= 64; t *= 2)
+			apply_after(t);
+	}];
 }
