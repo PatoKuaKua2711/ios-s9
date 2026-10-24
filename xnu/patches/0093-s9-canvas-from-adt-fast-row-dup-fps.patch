@@ -1,0 +1,81 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index e32b4d1..5b649f3 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -111,6 +111,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	IOInterruptEventSource *fPresentSrc;
+ 	uint64_t                fPresentNs, fPresentMaxNs;     /* stats, logged every 300 frames */
+ 	uint32_t                fPresentCount;
++	uint64_t                fStatsStart;    /* mach time of the first frame of the 300 */
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static void presentFired(OSObject *owner, IOInterruptEventSource *sender, int count);
+@@ -212,6 +213,21 @@ AppleCLCD::start(IOService *provider)
+ 	if (!native) {
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
++		/*
++		 * Galaxy S9: the canvas size comes from the ADT (disp0 canvas-width/
++		 * height, the same numbers IOMobileFramebuffer.framework reads), so
++		 * an @2x 750x1624 canvas (mkadt.py --scale2) needs no kernel change.
++		 */
++		OSData *cw = OSDynamicCast(OSData, provider->getProperty("canvas-width"));
++		OSData *ch = OSDynamicCast(OSData, provider->getProperty("canvas-height"));
++		if (cw != NULL && ch != NULL && cw->getLength() == 4 && ch->getLength() == 4) {
++			uint32_t w = *(const uint32_t *)cw->getBytesNoCopy();
++			uint32_t h = *(const uint32_t *)ch->getBytesNoCopy();
++			if (w >= 320 && h >= 480 && w <= 4096 && h <= 4096) {
++				fLogicalW = w;
++				fLogicalH = h;
++			}
++		}
+ 	}
+ 	fOffX = ((int32_t)fLogicalW - (int32_t)fWidth) / 2;
+ 	fOffY = ((int32_t)fLogicalH - (int32_t)fHeight) / 2;
+@@ -405,9 +421,16 @@ AppleCLCD::presentPending(void)
+ 		if (ns > fPresentMaxNs) {
+ 			fPresentMaxNs = ns;
+ 		}
++		if (fPresentCount == 0) {
++			fStatsStart = t0;
++		}
+ 		if (++fPresentCount == 300) {
+-			IOLog("SWEET FB: present avg %llu us max %llu us (300 frames)\n",
+-			    fPresentNs / 300000, fPresentMaxNs / 1000);
++			uint64_t span;
++			absolutetime_to_nanoseconds(mach_absolute_time() - fStatsStart, &span);
++			/* fps over the window; idle gaps (nothing to draw) count, so it is a lower bound */
++			IOLog("SWEET FB: present avg %llu us max %llu us, 300 frames in %llu ms (%llu.%llu fps)\n",
++			    fPresentNs / 300000, fPresentMaxNs / 1000, span / 1000000,
++			    300000000000ULL / (span ? span : 1) / 10, 300000000000ULL / (span ? span : 1) % 10);
+ 			fPresentCount = 0;
+ 			fPresentNs = fPresentMaxNs = 0;
+ 		}
+@@ -656,11 +679,25 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, uint32_t bpe, int32_t s
+ 	}
+ 	const uintptr_t base = src + s->offset;
+ 	markRows((int64_t)fPanY + py0, (int64_t)fPanY + py1);
++	int32_t last_ly = -1;
+ 	for (int32_t py = py0; py < py1; py++) {
+ 		int32_t ly = (int32_t)((int64_t)py * fLogicalH / fPanH);
+-		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly - dy) * s->bytesPerRow) + sx - dx;
+ 		uint32_t *drow = (uint32_t *)(fPixels + (uint64_t)(fPanY + py) * fRowBytes) + fPanX;
+-		for (int32_t px = px0; px < px1; px++) {
++		if (ly == last_ly) {
++			/* Upscaling repeats canvas rows: copy the panel row just written. */
++			memcpy(drow + px0, (const uint8_t *)(drow + px0) - fRowBytes, (size_t)(px1 - px0) * 4);
++			continue;
++		}
++		last_ly = ly;
++		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly - dy) * s->bytesPerRow) + sx - dx;
++		int32_t px = px0;
++		for (; px + 4 <= px1; px += 4) {
++			drow[px] = srow[fXTab[px]];
++			drow[px + 1] = srow[fXTab[px + 1]];
++			drow[px + 2] = srow[fXTab[px + 2]];
++			drow[px + 3] = srow[fXTab[px + 3]];
++		}
++		for (; px < px1; px++) {
+ 			drow[px] = srow[fXTab[px]];
+ 		}
+ 	}
