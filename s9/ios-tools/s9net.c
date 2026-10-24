@@ -1,12 +1,12 @@
 /*
  * Galaxy S9: internet over the USB cable (kernel ue0, CDC-ECM, sweetusb=2).
  * configd never adopts ue0 (it is no IOKit IONetworkInterface, so sweet's
- * preferences.plist service was ignored), so publish the service state
- * directly, the way a VPN daemon does: IPMonitor then installs the default
- * route through 192.168.7.1 and the DNS servers, and withdraws both when
- * the kernel reports the link down (cable out, KEV_DL_LINK_OFF).
- * The PC shares its connection on 192.168.7.1 (s9/tools/usb-internet.sh).
- * SCDynamicStore is SPI on iOS: the functions are declared here.
+ * preferences.plist service was ignored). CLI tools (ping, apt, ntp) use the
+ * route directly and work, but GUI apps (Safari, Sileo) gate on nw_path /
+ * SCNetworkReachability, which only sees a network if configd ranks a
+ * service as primary. So publish the service AND the global primary state
+ * directly, the way a VPN daemon does, then report what configd concludes.
+ * SCDynamicStore / SCNetworkReachability are public SystemConfiguration API.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
@@ -15,16 +15,49 @@
 typedef const struct __SCDynamicStore *SCDynamicStoreRef;
 extern SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef, CFStringRef, void *, void *);
 extern Boolean SCDynamicStoreSetValue(SCDynamicStoreRef, CFStringRef, CFPropertyListRef);
+extern CFPropertyListRef SCDynamicStoreCopyValue(SCDynamicStoreRef, CFStringRef);
 
-#define SERVICE "State:/Network/Service/S9-USB-Ethernet"
+typedef const struct __SCNetworkReachability *SCNetworkReachabilityRef;
+typedef uint32_t SCNetworkReachabilityFlags;
+extern SCNetworkReachabilityRef SCNetworkReachabilityCreateWithName(CFAllocatorRef, const char *);
+extern Boolean SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef, SCNetworkReachabilityFlags *);
+
+#define SERVICE_ID "S9-USB-Ethernet"
+#define SERVICE "State:/Network/Service/" SERVICE_ID
+#define IFACE "ue0"
+#define ROUTER "192.168.7.1"
+#define SELF "192.168.7.2"
 
 static CFArrayRef
-one(const char *s)
+cfarray(const char *const *items, int n)
 {
-	CFStringRef v = CFStringCreateWithCString(NULL, s, kCFStringEncodingUTF8);
-	CFArrayRef a = CFArrayCreate(NULL, (const void **)&v, 1, &kCFTypeArrayCallBacks);
-	CFRelease(v);
+	CFStringRef v[4];
+	for (int i = 0; i < n; i++) {
+		v[i] = CFStringCreateWithCString(NULL, items[i], kCFStringEncodingUTF8);
+	}
+	CFArrayRef a = CFArrayCreate(NULL, (const void **)v, n, &kCFTypeArrayCallBacks);
+	for (int i = 0; i < n; i++) {
+		CFRelease(v[i]);
+	}
 	return a;
+}
+
+static void
+setdict(SCDynamicStoreRef st, const char *key, CFDictionaryRef d)
+{
+	CFStringRef k = CFStringCreateWithCString(NULL, key, kCFStringEncodingUTF8);
+	SCDynamicStoreSetValue(st, k, d);
+	CFRelease(k);
+}
+
+static void
+report(SCNetworkReachabilityRef r, const char *who)
+{
+	SCNetworkReachabilityFlags f = 0;
+	Boolean ok = r && SCNetworkReachabilityGetFlags(r, &f);
+	printf("s9net: reachability %s: %s flags=0x%x reachable=%d needs-connection=%d\n",
+	    who, ok ? "ok" : "FAILED", f, (f & 2) ? 1 : 0, (f & 4) ? 1 : 0);
+	fflush(stdout);
 }
 
 int
@@ -35,23 +68,65 @@ main(void)
 		fprintf(stderr, "s9net: no dynamic store\n");
 		return 1;
 	}
+	const char *one_self[] = { SELF };
+	const char *one_mask[] = { "255.255.255.0" };
+	const char *dns_servers[] = { "1.1.1.1", "8.8.8.8", "8.8.4.4" };
+
+	/* Per-service IPv4 + DNS (the interface, address, router). */
 	CFMutableDictionaryRef ip = CFDictionaryCreateMutable(NULL, 0,
 	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	CFDictionarySetValue(ip, CFSTR("Addresses"), one("192.168.7.2"));
-	CFDictionarySetValue(ip, CFSTR("SubnetMasks"), one("255.255.255.0"));
-	CFDictionarySetValue(ip, CFSTR("Router"), CFSTR("192.168.7.1"));
-	CFDictionarySetValue(ip, CFSTR("InterfaceName"), CFSTR("ue0"));
+	CFArrayRef addrs = cfarray(one_self, 1), masks = cfarray(one_mask, 1);
+	CFDictionarySetValue(ip, CFSTR("Addresses"), addrs);
+	CFDictionarySetValue(ip, CFSTR("SubnetMasks"), masks);
+	CFDictionarySetValue(ip, CFSTR("Router"), CFSTR(ROUTER));
+	CFDictionarySetValue(ip, CFSTR("InterfaceName"), CFSTR(IFACE));
 
 	CFMutableDictionaryRef dns = CFDictionaryCreateMutable(NULL, 0,
 	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	const void *servers[2] = { CFSTR("1.1.1.1"), CFSTR("8.8.8.8") };
-	CFArrayRef sa = CFArrayCreate(NULL, servers, 2, &kCFTypeArrayCallBacks);
-	CFDictionarySetValue(dns, CFSTR("ServerAddresses"), sa);
+	CFArrayRef servers = cfarray(dns_servers, 3);
+	CFDictionarySetValue(dns, CFSTR("ServerAddresses"), servers);
 
-	Boolean ok = SCDynamicStoreSetValue(st, CFSTR(SERVICE "/IPv4"), ip) &&
-	    SCDynamicStoreSetValue(st, CFSTR(SERVICE "/DNS"), dns);
-	printf("s9net: ue0 192.168.7.2 via 192.168.7.1, dns 1.1.1.1 8.8.8.8: %s\n", ok ? "published" : "FAILED");
+	/*
+	 * Global primary state: this is what nw_path / SCNetworkReachability read
+	 * to decide "there is a usable network". IPMonitor normally writes it from
+	 * ranked services; ue0 is not ranked (no IOKit interface), so set it here.
+	 */
+	CFMutableDictionaryRef gip = CFDictionaryCreateMutable(NULL, 0,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(gip, CFSTR("PrimaryService"), CFSTR(SERVICE_ID));
+	CFDictionarySetValue(gip, CFSTR("PrimaryInterface"), CFSTR(IFACE));
+	CFDictionarySetValue(gip, CFSTR("Router"), CFSTR(ROUTER));
+
+	CFMutableDictionaryRef gdns = CFDictionaryCreateMutable(NULL, 0,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFArrayRef servers2 = cfarray(dns_servers, 3);
+	CFDictionarySetValue(gdns, CFSTR("ServerAddresses"), servers2);
+
+	/* Interface link state, so IPMonitor/nwi treat ue0 as an active link. */
+	CFMutableDictionaryRef link = CFDictionaryCreateMutable(NULL, 0,
+	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(link, CFSTR("Active"), kCFBooleanTrue);
+
+	SCNetworkReachabilityRef before = SCNetworkReachabilityCreateWithName(NULL, "www.apple.com");
+	report(before, "before");
+
+	setdict(st, SERVICE "/IPv4", ip);
+	setdict(st, SERVICE "/DNS", dns);
+	setdict(st, "State:/Network/Interface/" IFACE "/Link", link);
+	setdict(st, "State:/Network/Global/IPv4", gip);
+	setdict(st, "State:/Network/Global/DNS", gdns);
+	printf("s9net: published service %s + global primary on %s via %s\n", SERVICE_ID, IFACE, ROUTER);
 	fflush(stdout);
+
+	/* Give configd a moment, then report what it concluded. */
+	for (int i = 0; i < 5; i++) {
+		sleep(2);
+		SCNetworkReachabilityRef r = SCNetworkReachabilityCreateWithName(NULL, "www.apple.com");
+		report(r, "after");
+		if (r) {
+			CFRelease(r);
+		}
+	}
 	/* stay: launchd KeepAlive restarts us if configd ever drops the session */
 	for (;;) {
 		pause();
