@@ -16,6 +16,10 @@ jobs:
         run: |
           cd s9/ios-tools
           mkdir -p out
+          # injection probe dylib (loaded into UIKit processes to prove injection)
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -dynamiclib \
+            -o out/s9probe.dylib probe.c
+          codesign -f -s - out/s9probe.dylib
           for t in s9net; do
             xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -Wall \
               -framework CoreFoundation -framework SystemConfiguration "$t.c" -o "out/$t"
