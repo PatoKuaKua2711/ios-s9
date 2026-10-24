@@ -1,0 +1,8 @@
+{
+  "name": "s9-frida",
+  "private": true,
+  "description": "frida-objc-bridge for tools/s9-objc.py (npm install here)",
+  "dependencies": {
+    "frida-objc-bridge": "^8.0.6"
+  }
+}

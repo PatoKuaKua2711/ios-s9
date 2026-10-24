@@ -9,16 +9,21 @@
  *   A. ZERO-COPY: a pipe can scan out a buffer outside the ABL's splash
  *      region (its SMMU stream must let it read any RAM) -> the kernel can
  *      point the pipe at iOS's own IOSurface instead of copying it.
- *   B. HARDWARE SCALE: a VIG pipe enlarges a 750x1624 (@2x canvas) buffer to
- *      the panel -> no CPU work at all for presentation.
+ *   B. HARDWARE SCALE: a VIG pipe enlarges a 828x1792 (@2x canvas, iPhone XR
+ *      size) buffer to the panel -> no CPU work at all for presentation.
+ *   C. 60 HZ: ABL leaves pingpong autorefresh at 0x80000002 (a frame every 2nd
+ *      TE = 30 Hz). Count the frames the pipe sends per second (write-pointer
+ *      wraps) and the panel TEs (read-pointer frame count), switch to every
+ *      TE (0x80000001) and count again.
  *
  * Steps (each shown on screen first, so a hang leaves the step in the photo):
  *   0. read-only dump: CTL (which pipes blend into which mixer), each active
  *      pipe's rectangles/address/format, VIG scaler version and mode;
  *   A. copy the screen to buffer B (0xb0000000, free RAM per M8), mark it,
  *      point the active pipes at B, flush;
- *   B. draw a 750x1624 test card at C (0xb2000000), point the VIG pipes at C
- *      with QSEED3 bilinear 375x1624 -> 720x2960 per mixer half, flush.
+ *   B. draw a 828x1792 test card at C (0xb2000000), point the VIG pipes at C
+ *      with QSEED3 bilinear 414x1792 -> 720x2960 per mixer half, flush;
+ *   C. after restoring the ABL layout: frame rate at autorefresh 2, then 1.
  * Register layouts: sde_hw_ctl.c, sde_hw_sspp.c, sde_hw_util.c
  * (sde_hw_setup_scaler3) and sde_plane.c (_sde_plane_setup_scaler3) of the
  * Samsung/LineageOS kernel. MMU off: everything is Device memory.
@@ -82,9 +87,15 @@
 #define PHASE_STEP_SHIFT 21
 
 #define BUF_B		0xb0000000UL	/* panel-sized copy, 17 MiB */
-#define BUF_C		0xb2000000UL	/* 750x1624 test card, 4.9 MiB */
-#define C_W		750
-#define C_H		1624
+#define BUF_C		0xb2000000UL	/* 828x1792 test card, 5.7 MiB */
+#define C_W		828
+#define C_H		1792
+
+/* Pingpong blocks (sde_hw_pingpong.c) */
+#define PP_INT_COUNT_VAL	0x014	/* [31:16] read-pointer (TE) frame count */
+#define PP_LINE_COUNT		0x02c	/* write-pointer line: wraps once per frame sent */
+#define PP_AUTOREFRESH_CONFIG	0x030
+static const uint32_t pp_off[MDSS_NPP] = { 0x71000, 0x71800, 0x72000, 0x72800, 0x73000 };
 
 static const uint32_t sspp_off[MDSS_NSSPP] = {
 	0x5000, 0x7000, 0x9000, 0xb000, 0x25000, 0x27000, 0x29000, 0x2b000,
@@ -158,6 +169,36 @@ static void fb_target(uintptr_t base, uint32_t w, uint32_t h)
 static void fb_restore(void)
 {
 	fb = saved;
+}
+
+/* Frames the pingpong sent and panel TEs seen in one second. */
+static void count_frames(uintptr_t pp, uint32_t *sent, uint32_t *te)
+{
+	uint64_t f = rsr("cntfrq_el0"), t0 = rsr("cntpct_el0");
+	uint32_t te0 = rd32(pp + PP_INT_COUNT_VAL) >> 16, last = rd32(pp + PP_LINE_COUNT) & 0xffff;
+
+	*sent = 0;
+	while (rsr("cntpct_el0") - t0 < f) {
+		uint32_t l = rd32(pp + PP_LINE_COUNT) & 0xffff;
+		if (l < last)
+			(*sent)++;
+		last = l;
+		if (((rsr("cntpct_el0") - t0) & 0xfffff) == 0)
+			wdog_pet();
+	}
+	*te = ((rd32(pp + PP_INT_COUNT_VAL) >> 16) - te0) & 0xffff;
+}
+
+static void show_rate(const char *what, uintptr_t pp)
+{
+	char b[96], *p;
+	uint32_t sent, te;
+
+	count_frames(pp, &sent, &te);
+	p = put_dec(put(b, "enviados/s="), sent);
+	p = put_dec(put(p, " TE/s="), te);
+	put_hex(put(p, " autorefresh="), rd32(pp + PP_AUTOREFRESH_CONFIG), 8);
+	con_str(what, b);
 }
 
 void shim_main(uint64_t dtb)
@@ -291,11 +332,11 @@ void shim_main(uint64_t dtb)
 		goto restore;
 	}
 	stage = "B cartao";
-	step("B desenha 750x1624 em 0xb2000000");
+	step("B desenha 828x1792 em 0xb2000000");
 	fb_target(BUF_C, C_W, C_H);
-	for (int y = 0; y < C_H; y += 58)
-		fb_rect(0, y, C_W, 58, ((y / 58) & 1) ? 0x203060 : 0x406090);
-	for (int x = 0; x < C_W; x += 75)
+	for (int y = 0; y < C_H; y += 64)
+		fb_rect(0, y, C_W, 64, ((y / 64) & 1) ? 0x203060 : 0x406090);
+	for (int x = 0; x < C_W; x += 69)
 		fb_rect(x, 0, 3, C_H, YELLOW);
 	fb_rect(0, 0, C_W, 4, RED);
 	fb_rect(0, C_H - 4, C_W, 4, RED);
@@ -303,12 +344,12 @@ void shim_main(uint64_t dtb)
 	fb_rect(C_W - 4, 0, 4, C_H, RED);
 	fb_text(30, 300, 4, "B: ESCALA POR", WHITE, BLACK);
 	fb_text(30, 380, 4, "HARDWARE OK", WHITE, BLACK);
-	fb_text(30, 500, 2, "750x1624 -> 1440x2960, 0% CPU", WHITE, BLACK);
+	fb_text(30, 500, 2, "828x1792 -> 1440x2960, 0% CPU", WHITE, BLACK);
 	fb_restore();
 	dsb();
 
 	stage = "B escalador";
-	step("B QSEED3 375x1624 -> 720x2960 por metade");
+	step("B QSEED3 414x1792 -> 720x2960 por metade");
 	flush = CTL_FLUSH_CTL;
 	for (int k = 0; k < nact; k++) {
 		int i = active[k];
@@ -401,6 +442,32 @@ restore:
 	dsb();
 	wr32(c + CTL_FLUSH, flush);
 	con_str("", "Registradores do ABL restaurados.");
+
+	/* C. 60 Hz: autorefresh on every TE instead of every other one. */
+	stage = "C 60 Hz";
+	step("C mede quadros/s com autorefresh do ABL");
+	int npp = 0;
+	uintptr_t pp0 = 0;
+	for (int i = 0; i < MDSS_NPP; i++) {
+		if (!(st.pp_autorefresh[i] & (1U << 31)))
+			continue;
+		if (!npp++)
+			pp0 = MDSS_BASE + pp_off[i];
+	}
+	if (!npp) {
+		con_str("C", "pulado: nenhum pingpong com autorefresh");
+		goto end;
+	}
+	show_rate("C antes", pp0);
+	step("C autorefresh a cada TE (0x80000001)");
+	for (int i = 0; i < MDSS_NPP; i++)
+		if (st.pp_autorefresh[i] & (1U << 31))
+			wr32(MDSS_BASE + pp_off[i] + PP_AUTOREFRESH_CONFIG, (1U << 31) | 1);
+	dsb();
+	wait_ms(200);
+	show_rate("C depois", pp0);
+	show_rate("C depois", pp0);
+	con_str("C", "60 Hz OK se 'depois' mostra ~60 enviados/s e a tela segue normal.");
 
 end:
 	stage = "fim";

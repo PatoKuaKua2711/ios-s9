@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5b649f3..3119f81 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -38,6 +38,30 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++/*
++ * Galaxy S9: the S6E3HA8 is a command-mode panel. ABL leaves the pingpong
++ * blocks' autorefresh at 0x80000002: the display engine re-sends the
++ * framebuffer on every 2nd tearing-effect pulse, so the panel shows 30 Hz
++ * whatever we draw. frame_count 1 = a frame on every TE (60 Hz), measured
++ * in shim M9 step C. Only pingpongs that ABL left enabled are touched.
++ */
++#define S9_PP_PA                0x0ae71000UL    /* pingpong 0..4, 0x800 apart */
++#define S9_PP_AUTOREFRESH       0x030
++static void
++s9_panel_autorefresh(uint32_t every_te)
++{
++	vm_offset_t pp = ml_io_map(S9_PP_PA, 0x2800);
++	for (uint32_t i = 0; pp != 0 && i < 5; i++) {
++		volatile uint32_t *r = (volatile uint32_t *)(pp + 0x800 * i + S9_PP_AUTOREFRESH);
++		uint32_t v = *r;
++		if (v & (1U << 31)) {
++			*r = (1U << 31) | every_te;
++			IOLog("SWEET FB: pingpong %u autorefresh 0x%x -> 0x%x\n", i, v, *r);
++		}
++	}
++}
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -292,6 +316,9 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
++	if (hz >= 60) {
++		s9_panel_autorefresh(1);
++	}
+ 	int vsync60 = 0;
+ 	PE_parse_boot_argn("sweetfb_vsync60", &vsync60, sizeof(vsync60));
+ 	fVsync60 = vsync60 != 0;

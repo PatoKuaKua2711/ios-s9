@@ -46,6 +46,14 @@ VTIMER_INTID = 19
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
+# Canvas (pixels) and artwork subtype per display-scale. UIKit picks the
+# status bar layout (_UIStatusBarVisualProvider_Split<width>) by the native
+# pixel width AND the notch size, and the notch comes from SpringBoard's
+# screen type, looked up from points, scale and artwork-device-subtype
+# (SBHScreenTypeForCurrentDevice). So @2x must be a whole iPhone XR screen:
+# 828 px wide (Split828) and subtype 1792, or the bar falls back to red.
+CANVAS = {3: (1125, 2436, 2436), 2: (828, 1792, 1792)}
+
 BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
@@ -112,9 +120,11 @@ def build(seed=None, qemu=False, highmem=False, scale=3):
         # from /chosen, the pixel size from IOMobileFramebuffer. Scale 0 makes
         # SpringBoard's FBSDisplayMode "infxinf@0x" invalid. 1080x2400 @3x =
         # 360x800 points (like iPhone X class devices).
-        # Galaxy S9 --scale2: the same 375x812 points at @2x (750x1624), 2.25x
-        # fewer pixels for CoreAnimation's CPU renderer; the kernel reads
-        # the canvas size from disp0 below and scales it to the panel.
+        # Galaxy S9 --scale2: the iPhone XR/11 screen, 414x896 points at @2x
+        # (828x1792), 46% fewer pixels than @3x for CoreAnimation's CPU
+        # renderer; the kernel reads the canvas size from disp0 below and
+        # scales it to the panel. 375x812 @2x (750x1624) is no real iPhone:
+        # UIKit has no status bar provider for it (red "rdar:45025538" bar).
         ('display-scale', u32(scale)),
         # XNU derives IOPlatformUUID (gethostuuid) from these on arm; without
         # them CFPreferences cannot use kCFPreferencesCurrentHost (no ByHost
@@ -196,8 +206,8 @@ def build(seed=None, qemu=False, highmem=False, scale=3):
             ph(),
             ('device_type', cstr('display-subsystem')),
             ('compatible', cstr('sweet,display')),
-            ('canvas-width', u32(375 * scale)),
-            ('canvas-height', u32(812 * scale)),
+            ('canvas-width', u32(CANVAS[scale][0])),
+            ('canvas-height', u32(CANVAS[scale][1])),
         ])])
 
     fbcon = node('sweet-fbcon', [
@@ -231,6 +241,9 @@ def build(seed=None, qemu=False, highmem=False, scale=3):
     ])
 
     product_props = d22ap_product()
+    if product_props and scale != 3:
+        over = {'artwork-device-subtype': u32(CANVAS[scale][2]), 'artwork-scale-factor': u32(scale)}
+        product_props = [(k, over.get(k, v)) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
     # Panic log region. /pram reg = <phys size>; it sits just above the
