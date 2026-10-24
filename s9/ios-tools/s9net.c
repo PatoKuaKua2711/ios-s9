@@ -86,22 +86,6 @@ main(void)
 	CFArrayRef servers = cfarray(dns_servers, 3);
 	CFDictionarySetValue(dns, CFSTR("ServerAddresses"), servers);
 
-	/*
-	 * Global primary state: this is what nw_path / SCNetworkReachability read
-	 * to decide "there is a usable network". IPMonitor normally writes it from
-	 * ranked services; ue0 is not ranked (no IOKit interface), so set it here.
-	 */
-	CFMutableDictionaryRef gip = CFDictionaryCreateMutable(NULL, 0,
-	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	CFDictionarySetValue(gip, CFSTR("PrimaryService"), CFSTR(SERVICE_ID));
-	CFDictionarySetValue(gip, CFSTR("PrimaryInterface"), CFSTR(IFACE));
-	CFDictionarySetValue(gip, CFSTR("Router"), CFSTR(ROUTER));
-
-	CFMutableDictionaryRef gdns = CFDictionaryCreateMutable(NULL, 0,
-	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
-	CFArrayRef servers2 = cfarray(dns_servers, 3);
-	CFDictionarySetValue(gdns, CFSTR("ServerAddresses"), servers2);
-
 	/* Interface link state, so IPMonitor/nwi treat ue0 as an active link. */
 	CFMutableDictionaryRef link = CFDictionaryCreateMutable(NULL, 0,
 	    &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
@@ -113,9 +97,13 @@ main(void)
 	setdict(st, SERVICE "/IPv4", ip);
 	setdict(st, SERVICE "/DNS", dns);
 	setdict(st, "State:/Network/Interface/" IFACE "/Link", link);
-	setdict(st, "State:/Network/Global/IPv4", gip);
-	setdict(st, "State:/Network/Global/DNS", gdns);
-	printf("s9net: published service %s + global primary on %s via %s\n", SERVICE_ID, IFACE, ROUTER);
+	/*
+	 * NB: do NOT force State:/Network/Global/IPv4 PrimaryService here. Flipping
+	 * the primary network abruptly woke every network daemon at once and the
+	 * CPU-only compositor missed SpringBoard's watchdog -> panic. Let IPMonitor
+	 * rank the service; measure reachability and decide the real fix from data.
+	 */
+	printf("s9net: published service %s on %s via %s (no forced primary)\n", SERVICE_ID, IFACE, ROUTER);
 	fflush(stdout);
 
 	/* Give configd a moment, then report what it concluded. */
