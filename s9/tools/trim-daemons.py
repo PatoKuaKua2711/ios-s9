@@ -30,14 +30,18 @@ REMOVE = [
  "assistant",".siri","siriknowledge","siriinference","corespeech","sirittsd",
  "spotlight","searchd","corespotlight","suggestd","parsec","proactive",
  "health","homed","homeenergy","HomeKit",
- "remindd","chronod","nfcd","nfc.","locationd","mobileasset","duet","coreidvd",
+ "remindd","nfcd","nfc.","locationd","mobileasset","duet","coreidvd",
  "accessoryupdater","remotepairing","mediaanalysis","photoanalysis","photolibrary",
  "newsd","stocks","weatherd","tipsd","gamed","gamecenter","familycircle",
  "familynotification","screentime","followupd","triald",
  "passd","wallet","appstore","softwareupdate","storedownload","storeaccount",
  "videosubscriptions","bluetoothd","bluetooth","fairplayd","wifivelocity",
  "wifianalytics","mapspushd","navd","itunesstored",
+ # App Store ads: promotedcontentd alone ate ~30 % of a core at idle.
+ "ap.promotedcontentd","ap.adprivacyd",
 ]
+# chronod stays: without it a widget host scene in SpringBoard fails and is
+# re-activated forever (~33 % of a core on the main thread at idle).
 # Never remove these (critical infrastructure), even if they match above.
 KEEP = [
  "backboard","SpringBoard","mediaserverd","mediaremote","runningboard","cfprefs",

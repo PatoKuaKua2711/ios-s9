@@ -1,0 +1,422 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index af1a84f..e32b4d1 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -25,7 +25,8 @@
+  * Everything else is accepted and logged once.
+  *
+  * SwapEnd copies the enabled layers' surfaces into the panel memory (no
+- * scaling, CPU copy). Vsync (notification type 5) is a 60 Hz timer that
++ * scaling, CPU copy). Vsync (notification type 5) is a timer (S9: at the
++ * presented rate, sweetfb_hz) that
+  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
+  * enabled it, through the port they registered (IOConnectSetNotificationPort).
+  *
+@@ -46,6 +47,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IOWorkLoop.h>
+ #include <IOKit/IOTimerEventSource.h>
++#include <IOKit/IOInterruptEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+@@ -96,8 +98,23 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	IOWorkLoop         *fWorkLoop;
+ 	IOTimerEventSource *fVsync;
+ 	uint64_t            fVsyncCount;
++	/*
++	 * Galaxy S9: vsync at the rate the panel really shows (sweetfb_hz, 30):
++	 * a 60 Hz vsync made CoreAnimation render every frame on the CPU and
++	 * the timer showed only every second one. Each swap is shown at once
++	 * from its own work loop (thread), not at the next vsync tick.
++	 * sweetfb_vsync60=1: the old 60 Hz vsync with throttled copies.
++	 */
++	uint32_t                fVsyncUS;
++	bool                    fVsync60;
++	IOWorkLoop             *fPresentLoop;
++	IOInterruptEventSource *fPresentSrc;
++	uint64_t                fPresentNs, fPresentMaxNs;     /* stats, logged every 300 frames */
++	uint32_t                fPresentCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void presentFired(OSObject *owner, IOInterruptEventSource *sender, int count);
++	void presentPending(void);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -259,16 +276,36 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	uint32_t hz = 10;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+-	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
++	int vsync60 = 0;
++	PE_parse_boot_argn("sweetfb_vsync60", &vsync60, sizeof(vsync60));
++	fVsync60 = vsync60 != 0;
++	if (!fVsync60) {
++		fPresentLoop = IOWorkLoop::workLoop();
++		fPresentSrc = IOInterruptEventSource::interruptEventSource(this, &AppleCLCD::presentFired);
++		if (fPresentLoop == NULL || fPresentSrc == NULL ||
++		    fPresentLoop->addEventSource(fPresentSrc) != kIOReturnSuccess) {
++			IOLog("SWEET FB: no present work loop, 60 Hz vsync\n");
++			fVsync60 = true;
++		} else {
++			fPresentSrc->enable();
++		}
++	}
++	if (fVsync60) {
++		fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
++		fVsyncUS = SWEET_FB_VSYNC_US;
++	} else {
++		fFlushTicks = 1;
++		fVsyncUS = (hz == 0 || hz >= 60) ? SWEET_FB_VSYNC_US : 1000000 / hz;
++	}
++	fVsync->setTimeoutUS(fVsyncUS);
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, %s\n",
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, %s, vsync %u us%s\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH,
+-	    fCached ? "cached" : "write-combined");
++	    fCached ? "cached" : "write-combined", fVsyncUS, fVsync60 ? " (copies throttled)" : ", present on swap");
+ 	return true;
+ }
+ 
+@@ -307,7 +344,16 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->markRows(0, fb->fHeight);
+ 			fb->cleanRows();
+ 		}
+-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++		sender->setTimeoutUS(fb->fVsyncUS);
++		return;
++	}
++	if (!fb->fVsync60) {
++		bool redraw = fb->fDirty;       /* display back on: show the latest frame */
++		IOLockUnlock(fb->fLock);
++		if (redraw) {
++			fb->fPresentSrc->interruptOccurred(NULL, NULL, 0);
++		}
++		sender->setTimeoutUS(fb->fVsyncUS);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -325,7 +371,48 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->cleanRows();
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
+-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
++	sender->setTimeoutUS(fb->fVsyncUS);
++}
++
++void
++AppleCLCD::presentFired(OSObject *owner, __unused IOInterruptEventSource *sender, __unused int count)
++{
++	((AppleCLCD *)owner)->presentPending();
++}
++
++/* Present work loop: show the latest swap (if any and the display is on). */
++void
++AppleCLCD::presentPending(void)
++{
++	uint8_t *rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
++	if (rec == NULL) {
++		return;
++	}
++	IOLockLock(fLock);
++	bool go = fDirty && !fPowerOff;
++	if (go) {
++		memcpy(rec, fPending, SWEET_FB_SWAP_REC_SIZE);
++		fDirty = false;
++	}
++	IOLockUnlock(fLock);
++	if (go) {
++		uint64_t t0 = mach_absolute_time();
++		present(rec);
++		cleanRows();
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++		fPresentNs += ns;
++		if (ns > fPresentMaxNs) {
++			fPresentMaxNs = ns;
++		}
++		if (++fPresentCount == 300) {
++			IOLog("SWEET FB: present avg %llu us max %llu us (300 frames)\n",
++			    fPresentNs / 300000, fPresentMaxNs / 1000);
++			fPresentCount = 0;
++			fPresentNs = fPresentMaxNs = 0;
++		}
++	}
++	IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ }
+ 
+ void
+@@ -409,6 +496,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	IOLockUnlock(fLock);
++	if (!fVsync60) {
++		fPresentSrc->interruptOccurred(NULL, NULL, 0);
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..6156790 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -10,9 +10,16 @@
+  * answer is kIOReturnNotFound; answering with a handle is the path a
+  * userspace reboot takes, so no bag file is needed.
+  *
+- * Every call is logged (selector, caller, argument shapes, result) so the
+- * next selectors the system needs show up on the console; unknown ones fail
+- * with kIOReturnUnsupported.
++ * The first call of each selector is logged (selector, caller, argument
++ * shapes, result) so the next selectors the system needs show up on the
++ * console, plus the first failures; unknown ones fail with
++ * kIOReturnUnsupported. (Logging every call cost CPU: see wrap/unwrap.)
++ *
++ * Galaxy S9: wrap/unwrap (10/11). securityd wraps the keychain's metadata
++ * keys with aks_wrap_key; answered "unsupported" it retried forever, ~300
++ * calls a second, ~80 % of a core plus launchd's share. Without a SEP there
++ * is no hardware secret to wrap with, so a wrapped key is the key behind an
++ * 8-byte tag: the keychain works, but it is NOT protected at rest.
+  */
+ #include <pexpert/arm64/board_config.h>
+ 
+@@ -50,6 +57,10 @@ enum {
+ 	kAKSAssertConsume    = 101,     /* aks_assert_consume */
+ };
+ 
++/* Tag in front of a "wrapped" key (wrap = tag + key, as AES key wrap adds 8 bytes). */
++static const uint8_t sweet_aks_wrap_tag[8] = { 'S', '9', 'A', 'K', 'S', 'W', '0', '1' };
++#define SWEET_AKS_MAX_KEY       128
++
+ /* The system (device) bag handle. */
+ #define SWEET_AKS_SYSTEM_HANDLE 0
+ 
+@@ -163,6 +174,66 @@ sweet_aks_device_state(IOExternalMethodArguments *args)
+ 	return sweet_aks_struct_out(args, buf, n);
+ }
+ 
++/* Structure input (inband or descriptor) into buf; its length, or -1 if larger than max. */
++static int32_t
++sweet_aks_struct_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t max)
++{
++	if (args->structureInputDescriptor != NULL) {
++		uint32_t len = (uint32_t)args->structureInputDescriptor->getLength();
++		if (len > max) {
++			return -1;
++		}
++		args->structureInputDescriptor->readBytes(0, buf, len);
++		return (int32_t)len;
++	}
++	if (args->structureInputSize > max) {
++		return -1;
++	}
++	if (args->structureInputSize > 0) {
++		memcpy(buf, args->structureInput, args->structureInputSize);
++	}
++	return (int32_t)args->structureInputSize;
++}
++
++/* aks_wrap_key: scalars [handle, class], key in; class out, tag + key out. */
++static IOReturn
++sweet_aks_wrap(IOExternalMethodArguments *args)
++{
++	uint8_t buf[sizeof(sweet_aks_wrap_tag) + SWEET_AKS_MAX_KEY];
++	int32_t len = sweet_aks_struct_in(args, buf + sizeof(sweet_aks_wrap_tag), SWEET_AKS_MAX_KEY);
++	if (len <= 0 || args->scalarInputCount < 2 || args->scalarOutputCount < 1) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(buf, sweet_aks_wrap_tag, sizeof(sweet_aks_wrap_tag));
++	IOReturn ret = sweet_aks_struct_out(args, buf, sizeof(sweet_aks_wrap_tag) + (uint32_t)len);
++	if (ret == kIOReturnSuccess) {
++		args->scalarOutput[0] = args->scalarInput[1];
++		args->scalarOutputCount = 1;
++	}
++	bzero(buf, sizeof(buf));
++	return ret;
++}
++
++/* aks_unwrap_key: scalars [handle, class], tag + key in; key out. */
++static IOReturn
++sweet_aks_unwrap(IOExternalMethodArguments *args)
++{
++	uint8_t buf[sizeof(sweet_aks_wrap_tag) + SWEET_AKS_MAX_KEY];
++	int32_t len = sweet_aks_struct_in(args, buf, sizeof(buf));
++	args->scalarOutputCount = 0;
++	if (len <= (int32_t)sizeof(sweet_aks_wrap_tag) ||
++	    memcmp(buf, sweet_aks_wrap_tag, sizeof(sweet_aks_wrap_tag)) != 0) {
++		return kIOReturnBadArgument;
++	}
++	IOReturn ret = sweet_aks_struct_out(args, buf + sizeof(sweet_aks_wrap_tag),
++	    (uint32_t)len - sizeof(sweet_aks_wrap_tag));
++	bzero(buf, sizeof(buf));
++	return ret;
++}
++
++static uint64_t sweet_aks_logged;       /* selectors already logged (< 64) */
++static uint32_t sweet_aks_failures_logged;
++
+ static uint32_t
+ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
+ {
+@@ -227,15 +298,30 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey:
++		ret = sweet_aks_wrap(args);
++		break;
++	case kAKSUnwrapKey:
++		ret = sweet_aks_unwrap(args);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;
+ 	}
+ 
+-	char name[32];
+-	proc_selfname(name, sizeof(name));
+-	IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
+-	    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	bool first = selector >= 64 || !(sweet_aks_logged & (1ULL << selector));
++	if (first || (ret != kIOReturnSuccess && sweet_aks_failures_logged < 32)) {
++		if (selector < 64) {
++			sweet_aks_logged |= 1ULL << selector;
++		}
++		if (ret != kIOReturnSuccess) {
++			sweet_aks_failures_logged++;
++		}
++		char name[32];
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET AKS: %s sel %u arg0 %llu in %u/%u out %u/%u -> 0x%x\n", name, selector,
++		    arg0, in_scalars, in_struct, out_scalars, out_struct, ret);
++	}
+ 	return ret;
+ }
+ #endif /* SWEET */
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 8e29586..f6ac14c 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -137,6 +137,37 @@
+ struct sched_statistics PERCPU_DATA(sched_stats);
+ bool sched_stats_active;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Galaxy S9: XNU sees the eight cores as one homogeneous cluster, but cpus
++ * 4-7 are Cortex-A75 at 2.65 GHz, roughly twice as fast as the A55s at
++ * 1.69 GHz. Stock XNU takes the lowest numbered idle CPU, so CoreAnimation's
++ * single render thread in backboardd, the UI threads and every realtime
++ * thread kept landing on slow cores while the fast ones idled. Boot-arg
++ * sweetfast=MASK names the fast cores (default 0xf0, 0 = stock behaviour):
++ * realtime threads and threads at BASEPRI_DEFAULT or above take an idle fast
++ * core first and may preempt a background thread there; threads below take
++ * an idle slow core first, keeping the fast ones free.
++ */
++static cpumap_t sweet_fast_map = 0xf0;
++
++static inline bool
++sweet_wants_fast(thread_t thread)
++{
++	return thread->sched_pri >= BASEPRI_DEFAULT;
++}
++
++/* Idle CPU from idle_map in the thread's preferred class, else any; -1 if none. */
++static int
++sweet_pick_idle(cpumap_t idle_map, thread_t thread)
++{
++	cpumap_t fast = idle_map & sweet_fast_map;
++	cpumap_t slow = idle_map & ~sweet_fast_map;
++	cpumap_t first = sweet_wants_fast(thread) ? fast : slow;
++	return lsb_first(first ? first : idle_map);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ static uint64_t
+ deadline_add(uint64_t d, uint64_t e)
+ {
+@@ -468,6 +499,10 @@ sched_init(void)
+ 	if (PE_parse_boot_argn("direct_handoff", &direct_handoff, sizeof(direct_handoff))) {
+ 		allow_direct_handoff = direct_handoff;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	PE_parse_boot_argn("sweetfast", &sweet_fast_map, sizeof(sweet_fast_map));
++	kprintf("Scheduler: SWEET fast cores 0x%llx\n", (unsigned long long)sweet_fast_map);
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 	if (PE_parse_boot_argn("enable_skstsct", &enable_task_set_cluster_type, sizeof(enable_task_set_cluster_type))) {
+@@ -5083,6 +5118,19 @@ choose_processor(
+ 				 * idle processor. The platform layer had an opportunity to provide
+ 				 * the "least cost idle" processor above.
+ 				 */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				/* ...unless it is of the wrong speed class and the right one has an idle CPU. */
++				if (sweet_fast_map != 0) {
++					cpumap_t idle = pset->cpu_state_map[PROCESSOR_IDLE] & pset->primary_map &
++					    pset->recommended_bitmask;
++					bool fast = bit_test(sweet_fast_map, processor->cpu_id);
++					bool want = thread->sched_pri >= BASEPRI_RTQUEUES || sweet_wants_fast(thread);
++					if (fast != want && (idle & (want ? sweet_fast_map : ~sweet_fast_map)) != 0) {
++						processor = PROCESSOR_NULL;
++						break;
++					}
++				}
++#endif
+ 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
+ 					return processor;
+ 				}
+@@ -5246,7 +5294,33 @@ no_available_cpus:
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		int cpuid = sweet_fast_map != 0 ? sweet_pick_idle(idle_primary_map, thread) : lsb_first(idle_primary_map);
++		if (cpuid >= 0 && sweet_fast_map != 0 && sweet_wants_fast(thread) &&
++		    !bit_test(sweet_fast_map, cpuid)) {
++			/*
++			 * Only slow cores are idle: rather take a fast core from a
++			 * background (below utility) thread, which then moves to the
++			 * idle slow core when it is put back on the run queue.
++			 */
++			cpumap_t busy_fast = (pset->cpu_state_map[PROCESSOR_RUNNING] & sweet_fast_map &
++			    pset->primary_map & pset->recommended_bitmask &
++			    ~pset->pending_AST_URGENT_cpu_mask & ~pset->pending_AST_PREEMPT_cpu_mask);
++			processor_t victim = PROCESSOR_NULL;
++			for (int id = lsb_first(busy_fast); id >= 0; id = lsb_next(busy_fast, id)) {
++				processor_t p = processor_array[id];
++				if (p->current_pri < BASEPRI_UTILITY && p->current_pri < thread->sched_pri &&
++				    (victim == PROCESSOR_NULL || p->current_pri < victim->current_pri)) {
++					victim = p;
++				}
++			}
++			if (victim != PROCESSOR_NULL) {
++				return victim;
++			}
++		}
++#else
+ 		int cpuid = lsb_first(idle_primary_map);
++#endif
+ 		if (cpuid >= 0) {
+ 			processor = processor_array[cpuid];
+ 			return processor;
+@@ -8307,6 +8381,12 @@ try_again:
+ 	if (avoid_cpu0) {
+ 		primary_map = bit_ror64(primary_map, 1);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* Realtime threads (touch, audio, CoreAnimation) on a fast core when one is free. */
++	if ((primary_map & sweet_fast_map) != 0) {
++		primary_map &= sweet_fast_map;
++	}
++#endif
+ 
+ 	int rotid = lsb_first(primary_map);
+ 	if (rotid >= 0) {
