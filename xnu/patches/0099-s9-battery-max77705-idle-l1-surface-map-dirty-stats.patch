@@ -1,0 +1,1357 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..04cc7e9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_max77705.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 7b7946f..3f529e8 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -15,6 +15,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
++extern int sweet_bind_current_thread(int cpu);  /* osfmk/kern/sched_prim.c */
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -98,6 +99,12 @@ keys_thread(void *arg, wait_result_t result)
+ 	unsigned errors = 0;
+ 	(void)arg;
+ 	(void)result;
++	/*
++	 * Galaxy S9: 50 wake-ups a second at kernel priority, which the
++	 * fast-core scheduling (0092) would put on an A75 next to
++	 * CoreAnimation's renderer: an A55 polls (cpu 0).
++	 */
++	printf("SWEET KEYS: polling on cpu %d\n", sweet_bind_current_thread(0));
+ 	for (;;) {
+ 		uint8_t pon = 0, gpio = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+diff --git a/bsd/dev/sweet_max77705.c b/bsd/dev/sweet_max77705.c
+new file mode 100644
+index 0000000..3d04725
+--- /dev/null
++++ b/bsd/dev/sweet_max77705.c
+@@ -0,0 +1,228 @@
++/*
++ * Galaxy S9: the Maxim MAX77705 (top PMIC, USB-C controller, charger and
++ * fuel gauge in one chip) on QUP i2c@a98000, bit-banged on that bus's pins,
++ * GPIO33 (SDA) and GPIO34 (SCL), the way i2c-gpio drives a bus: open drain
++ * by output enable with the output latch at 0, the board's pull-ups raise a
++ * released line. Same timing as the USB switch write proven in shim M7.11
++ * (half period 5 us, about 100 kHz, clock stretching honoured).
++ *
++ * Slave addresses (drivers/mfd/max77705.c of the Samsung/LineageOS kernel):
++ * PMIC 0x66, USB-C 0x25, charger 0x69, fuel gauge 0x36. Register reads are
++ * SMBus style: register byte, repeated START, data; 16-bit registers come
++ * little-endian (low byte first). Every user goes through one lock: the USB
++ * cold start (switch write) and the battery polling.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++int sweet_max77705_write(uint8_t addr, const uint8_t *buf, unsigned n);
++int sweet_max77705_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n);
++
++#define S9_TLMM_GPIO33_PA       0x03921000      /* north tile, 0x1000 per pin: GPIO33 SDA, GPIO34 SCL */
++#define S9_PIN_SDA              33
++#define S9_PIN_SCL              34
++#define S9_GPIO_OE              (1u << 9)
++#define S9_HALF_US              5
++
++static LCK_GRP_DECLARE(sweet_max77705_grp, "sweet_max77705");
++static LCK_MTX_DECLARE(sweet_max77705_lock, &sweet_max77705_grp);
++static vm_offset_t pm_gpio;
++
++static inline uint32_t
++pm_rd(vm_offset_t a)
++{
++	return *(volatile uint32_t *)a;
++}
++
++static inline void
++pm_wr(vm_offset_t a, uint32_t v)
++{
++	*(volatile uint32_t *)a = v;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static vm_offset_t
++pm_pin(unsigned pin)
++{
++	return pm_gpio + (pin - S9_PIN_SDA) * 0x1000;
++}
++
++static unsigned
++pm_level(unsigned pin)
++{
++	return pm_rd(pm_pin(pin) + 4) & 1;
++}
++
++static void
++pm_line(unsigned pin, bool high)
++{
++	pm_wr(pm_pin(pin), high ? 0 : S9_GPIO_OE);
++	delay(S9_HALF_US);
++}
++
++static bool
++pm_scl_high(void)
++{
++	pm_wr(pm_pin(S9_PIN_SCL), 0);
++	for (unsigned i = 0; !pm_level(S9_PIN_SCL); i++) {      /* clock stretching */
++		if (i > 10000) {
++			return false;
++		}
++		delay(1);
++	}
++	delay(S9_HALF_US);
++	return true;
++}
++
++static bool
++pm_start(void)
++{
++	pm_line(S9_PIN_SDA, true);
++	if (!pm_scl_high()) {
++		return false;
++	}
++	pm_line(S9_PIN_SDA, false);
++	pm_line(S9_PIN_SCL, false);
++	return true;
++}
++
++static void
++pm_stop(void)
++{
++	pm_line(S9_PIN_SDA, false);
++	(void)pm_scl_high();
++	pm_line(S9_PIN_SDA, true);
++}
++
++/* 0 acknowledged, EIO not, ETIMEDOUT clock stuck */
++static int
++pm_write_byte(uint8_t v)
++{
++	for (int i = 7; i >= 0; i--) {
++		pm_line(S9_PIN_SDA, (v >> i) & 1);
++		if (!pm_scl_high()) {
++			return ETIMEDOUT;
++		}
++		pm_line(S9_PIN_SCL, false);
++	}
++	pm_line(S9_PIN_SDA, true);
++	if (!pm_scl_high()) {
++		return ETIMEDOUT;
++	}
++	bool nack = pm_level(S9_PIN_SDA) != 0;
++	pm_line(S9_PIN_SCL, false);
++	return nack ? EIO : 0;
++}
++
++/* One byte, then ACK (more to come) or NACK (the last); -1 if the clock stuck. */
++static int
++pm_read_byte(bool ack)
++{
++	unsigned v = 0;
++	pm_line(S9_PIN_SDA, true);
++	for (int i = 0; i < 8; i++) {
++		if (!pm_scl_high()) {
++			return -1;
++		}
++		v = (v << 1) | pm_level(S9_PIN_SDA);
++		pm_line(S9_PIN_SCL, false);
++	}
++	pm_line(S9_PIN_SDA, !ack);
++	if (!pm_scl_high()) {
++		return -1;
++	}
++	pm_line(S9_PIN_SCL, false);
++	pm_line(S9_PIN_SDA, true);
++	return (int)v;
++}
++
++/* Map the two pins and make them plain GPIO inputs with the output latch at 0. Lock held. */
++static int
++pm_bus_ready(void)
++{
++	if (pm_gpio != 0) {
++		return 0;
++	}
++	pm_gpio = ml_io_map(S9_TLMM_GPIO33_PA, 0x2000);
++	if (pm_gpio == 0) {
++		return ENOMEM;
++	}
++	pm_wr(pm_pin(S9_PIN_SDA) + 4, 0);
++	pm_wr(pm_pin(S9_PIN_SCL) + 4, 0);
++	pm_wr(pm_pin(S9_PIN_SDA), 0);   /* GPIO function, input, no pull */
++	pm_wr(pm_pin(S9_PIN_SCL), 0);
++	delay(20);
++	return 0;
++}
++
++int
++sweet_max77705_write(uint8_t addr, const uint8_t *buf, unsigned n)
++{
++	lck_mtx_lock(&sweet_max77705_lock);
++	int err = pm_bus_ready();
++	if (!err) {
++		err = ETIMEDOUT;
++		if (pm_start()) {
++			err = pm_write_byte((uint8_t)(addr << 1));
++			if (err == EIO) {
++				err = ENXIO;    /* nobody at that address */
++			}
++			for (unsigned i = 0; i < n && !err; i++) {
++				err = pm_write_byte(buf[i]);
++			}
++		}
++		pm_stop();
++	}
++	lck_mtx_unlock(&sweet_max77705_lock);
++	return err;
++}
++
++int
++sweet_max77705_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n)
++{
++	lck_mtx_lock(&sweet_max77705_lock);
++	int err = pm_bus_ready();
++	if (err) {
++		goto out;
++	}
++	err = ETIMEDOUT;
++	if (!pm_start()) {
++		goto stop;
++	}
++	err = pm_write_byte((uint8_t)(addr << 1));
++	if (err == EIO) {
++		err = ENXIO;
++	}
++	if (err || (err = pm_write_byte(reg))) {
++		goto stop;
++	}
++	err = ETIMEDOUT;
++	if (!pm_start()) {      /* repeated START */
++		goto stop;
++	}
++	err = pm_write_byte((uint8_t)((addr << 1) | 1));
++	if (err) {
++		goto stop;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		int v = pm_read_byte(i + 1 < n);
++		if (v < 0) {
++			err = ETIMEDOUT;
++			goto stop;
++		}
++		buf[i] = (uint8_t)v;
++	}
++stop:
++	pm_stop();
++out:
++	lck_mtx_unlock(&sweet_max77705_lock);
++	return err;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index de32973..2363102 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -636,6 +636,9 @@ SYSCTL_QUAD(_kern, OID_AUTO, sweetfast, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fast
+     "S9: mask of the fast cores (0 = stock scheduling)");
+ SYSCTL_INT(_kern, OID_AUTO, sweet_parallelism, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_parallelism, 0,
+     "S9: dispatch_apply width reported for QoS default and above (0 = every core)");
++extern int sweet_idle_flush;    /* osfmk/arm64/cpu.c */
++SYSCTL_INT(_kern, OID_AUTO, sweet_idle_flush, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_idle_flush, 0,
++    "S9: 1 = clean and invalidate the L1 data cache before every idle WFI (stock), 0 = keep it (default)");
+ 
+ void
+ sweet_touch_init(void)
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 2247eea..9ee059a 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -139,17 +139,18 @@ usb_rd(vm_offset_t base, uint32_t off)
+ #define S9_AHB2PHY_PA           0x088ee000
+ #define S9_QSCRATCH_PA          0x0a6f8800      /* = QSCRATCH_PA below */
+ 
+-#define S9_TLMM_GPIO33_PA       0x03921000      /* north tile, 0x1000 per pin: GPIO33 SDA, GPIO34 SCL */
+-#define S9_MAX77705_USBC        0x25
++#define S9_MAX77705_USBC        0x25            /* bus: bsd/dev/sweet_max77705.c */
+ #define S9_MAX77705_COM_USB     0x09
+ 
++extern int sweet_max77705_write(uint8_t addr, const uint8_t *buf, unsigned n);
++
+ static const uint16_t s9_qusb2_init[] = {      /* qcom,qusb-phy-init-seq: value, offset */
+ 	0x23, 0x210, 0x03, 0x04, 0x7c, 0x18c, 0x80, 0x2c, 0x0a, 0x184, 0x19, 0xb4,
+ 	0x40, 0x194, 0x1b, 0x198, 0x21, 0x214, 0x0e, 0x220, 0x58, 0x224, 0x75, 0x240,
+ 	0x29, 0x244, 0xca, 0x248, 0x02, 0x24c, 0x03, 0x250, 0x00, 0x23c, 0x22, 0x210,
+ };
+ 
+-static vm_offset_t s9_tcs, s9_db, s9_gpio, s9_qs;
++static vm_offset_t s9_tcs, s9_db, s9_qs;
+ static uint32_t s9_db_size;
+ static bool s9_cold;
+ 
+@@ -534,95 +535,7 @@ s9_qusb2(vm_offset_t gcc)
+ 	return 0;
+ }
+ 
+-/* ---- MAX77705 USBC, I2C bit-banged on GPIO33/34 (open drain by output enable, ~100 kHz) ---- */
+-
+-static vm_offset_t
+-s9_pin(unsigned pin)
+-{
+-	return s9_gpio + (pin - 33) * 0x1000;
+-}
+-
+-static unsigned
+-s9_level(unsigned pin)
+-{
+-	return s9_rd(s9_pin(pin) + 4) & 1;
+-}
+-
+-static void
+-s9_line(unsigned pin, bool high)
+-{
+-	s9_wr(s9_pin(pin), high ? 0 : 1u << 9);
+-	delay(5);
+-}
+-
+-static bool
+-s9_scl_high(void)
+-{
+-	s9_wr(s9_pin(34), 0);
+-	for (unsigned i = 0; !s9_level(34); i++) {      /* clock stretching */
+-		if (i > 10000) {
+-			return false;
+-		}
+-		delay(1);
+-	}
+-	delay(5);
+-	return true;
+-}
+-
+-static bool
+-s9_i2c_start(void)
+-{
+-	s9_line(33, true);
+-	if (!s9_scl_high()) {
+-		return false;
+-	}
+-	s9_line(33, false);
+-	s9_line(34, false);
+-	return true;
+-}
+-
+-static void
+-s9_i2c_stop(void)
+-{
+-	s9_line(33, false);
+-	(void)s9_scl_high();
+-	s9_line(33, true);
+-}
+-
+-/* 0 acknowledged, 1 not, 2 clock stuck */
+-static int
+-s9_i2c_byte(uint8_t v)
+-{
+-	for (int i = 7; i >= 0; i--) {
+-		s9_line(33, (v >> i) & 1);
+-		if (!s9_scl_high()) {
+-			return 2;
+-		}
+-		s9_line(34, false);
+-	}
+-	s9_line(33, true);
+-	if (!s9_scl_high()) {
+-		return 2;
+-	}
+-	int nack = (int)s9_level(33);
+-	s9_line(34, false);
+-	return nack;
+-}
+-
+-static int
+-s9_i2c_write(const uint8_t *buf, unsigned n)
+-{
+-	int err = 2;
+-
+-	if (s9_i2c_start()) {
+-		err = s9_i2c_byte(S9_MAX77705_USBC << 1);
+-		for (unsigned i = 0; i < n && !err; i++) {
+-			err = s9_i2c_byte(buf[i]);
+-		}
+-	}
+-	s9_i2c_stop();
+-	return err;
+-}
++/* ---- MAX77705 USBC: the shared bit-banged bus of bsd/dev/sweet_max77705.c ---- */
+ 
+ static int
+ s9_max77705_usb(void)
+@@ -630,18 +543,9 @@ s9_max77705_usb(void)
+ 	/* opcode write at 0x21 (COMMAND_CONTROL1_WRITE 0x06, COM_USB), end mark 0x41 = 0 */
+ 	const uint8_t cmd[3] = { 0x21, 0x06, S9_MAX77705_COM_USB }, end[2] = { 0x41, 0x00 };
+ 
+-	s9_gpio = ml_io_map(S9_TLMM_GPIO33_PA, 0x2000);
+-	if (!s9_gpio) {
+-		return ENOMEM;
+-	}
+-	s9_wr(s9_pin(33) + 4, 0);       /* output latch 0: the output enable alone pulls low */
+-	s9_wr(s9_pin(34) + 4, 0);
+-	s9_wr(s9_pin(33), 0);           /* GPIO function, input, no pull */
+-	s9_wr(s9_pin(34), 0);
+-	delay(20);
+-	int err = s9_i2c_write(cmd, 3);
++	int err = sweet_max77705_write(S9_MAX77705_USBC, cmd, 3);
+ 	if (!err) {
+-		err = s9_i2c_write(end, 2);
++		err = sweet_max77705_write(S9_MAX77705_USBC, end, 2);
+ 	}
+ 	return err ? EIO : 0;
+ }
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 20025d0..6d6fa28 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -3,6 +3,29 @@
+  * sweetbattery=1: read-only PM6150 polling every 30 seconds; voltage-derived
+  * SOC is an UNCALIBRATED estimate, not a replacement for the Linux QG algo.
+  * See report.md for binary evidence, register provenance and integration.
++ *
++ * Galaxy S9 (the default on this board, boot-arg sweetbattery=0 for the
++ * static fallback): the battery is measured by the MAX77705's fuel gauge and
++ * charged by its charger, both on the bit-banged bus of
++ * bsd/dev/sweet_max77705.c, polled every 10 s. Read only unless asked:
++ *   fuel gauge 0x36 (ModelGauge m5, drivers/battery_v2/max77705_fuelgauge.c):
++ *     RepSOC 0x06 (1/256 %), VCell 0x09 (78.125 uV), Current 0x0A and
++ *     AvgCurrent 0x0B (1.5625 uV / 5 mOhm = 312.5 uA, positive = charging),
++ *     RepCap 0x05 and FullCapRep 0x35 (1 mAh with the 5 mOhm sense resistor,
++ *     DT fg_resistor = 2), Cycles 0x17 (1 % of a cycle), TTE 0x11 / TTF 0x20
++ *     (5.625 s), Status 0x00 bit 3 = battery absent;
++ *   charger 0x69 (drivers/battery_v2/max77705_charger.c): CHG_INT_OK 0xB2
++ *     bit 6 = CHGIN valid, CHG_DETAILS_01 0xB4 low nibble (0-2 charging, 3-4
++ *     done, 8 off, 0xB watchdog expired), CNFG_00 0xB7 mode (bit 0 charger,
++ *     bit 2 buck, bit 4 watchdog), CNFG_09 0xC0 input limit and CHG_EN.
++ * Samsung's Linux (TWRP runs it too) leaves the charger OFF on shutdown
++ * (max77705_charger_shutdown: CNFG_00 = 0x04 buck only, CNFG_09 = 0x0F =
++ * 400 mA input, CHG_EN 0). Whether ABL turns it back on is logged at boot.
++ * sysctl kern.sweet_charge=1 turns charging on the way Linux does
++ * (max77705_set_charger_state: CNFG_00 bit 0, with CHG_EN), only with a
++ * sane float voltage (CNFG_04 <= 4.35 V) and the cell below 4.30 V, and
++ * turns it off again on its own at 4.36 V or when the gauge stops answering;
++ * 2 turns it off. Nobody writes the charger otherwise.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <device/device_types.h> /* io_buf_ptr_t for private OSKext headers */
+@@ -12,9 +35,59 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include <sys/sysctl.h>
++#include <libkern/libkern.h>
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* bsd/dev/sweet_max77705.c, osfmk/kern/sched_prim.c */
++extern "C" int sweet_max77705_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n);
++extern "C" int sweet_max77705_write(uint8_t addr, const uint8_t *buf, unsigned n);
++extern "C" int sweet_bind_current_thread(int cpu);
++
++#define S9_FG                   0x36
++#define S9_CHG                  0x69
++#define S9_FG_STATUS            0x00
++#define S9_FG_REPCAP            0x05
++#define S9_FG_REPSOC            0x06
++#define S9_FG_VCELL             0x09
++#define S9_FG_CURRENT           0x0A
++#define S9_FG_AVGCURRENT        0x0B
++#define S9_FG_TTE               0x11
++#define S9_FG_CYCLES            0x17
++#define S9_FG_DESIGNCAP         0x18
++#define S9_FG_TTF               0x20
++#define S9_FG_FULLCAPREP        0x35
++#define S9_CHG_INT_OK           0xB2
++#define S9_CHG_DETAILS_00       0xB3
++#define S9_CHG_DETAILS_01       0xB4
++#define S9_CHG_DETAILS_02       0xB5
++#define S9_CHG_CNFG_00          0xB7
++#define S9_CHG_CNFG_02          0xB9
++#define S9_CHG_CNFG_04          0xBB
++#define S9_CHG_CNFG_06          0xBD
++#define S9_CHG_CNFG_09          0xC0
++#define S9_CHGIN_OK             (1u << 6)
++#define S9_CNFG00_CHG           (1u << 0)
++#define S9_CNFG00_BUCK          (1u << 2)
++#define S9_CNFG09_CHG_EN        0x80
++#define S9_CV_4350MV            0x13    /* CNFG_04: 4200 + 10 * (code - 4) mV above 0x04 */
++#define S9_BATTERY_CPU          2       /* an A55: the bit-banged reads spin (~16 ms a poll) */
++#define S9_POLL_MS              10000
++
++/*
++ * The last S9 reading, for userland (sysctl kern.sweet_battery), and the
++ * charge switch (sysctl kern.sweet_charge, see the top).
++ */
++static char sweet_battery_state[256] = "no reading yet";
++static int sweet_charge_mode;           /* 0 untouched, 1 on by us, 2 off by us */
++static int sweet_charge_request = -1;   /* written by the sysctl, applied by the next poll */
++
++struct s9_battery_regs {
++	uint16_t status, repcap, repsoc, vcell, tte, cycles, designcap, ttf, fullcaprep;
++	int16_t current, avgcurrent;
++	uint8_t int_ok, dtls0, dtls1, dtls2, cnfg00, cnfg02, cnfg04, cnfg09;
++};
+ 
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+@@ -26,13 +99,21 @@ public:
+ private:
+ 	IOWorkLoop *fLoop;
+ 	IOTimerEventSource *fTimer;
+-	bool fTimerAdded, fRunning, fReal;
++	bool fTimerAdded, fRunning, fReal, fS9, fS9Good, fBound;
+ 	int fLastMode;
++	uint8_t fLastDtls1, fLastIntOk, fLastCnfg00;
++	unsigned fS9Errors;
+ 	void putNumber(const char *key, UInt32 value);
+ 	void putBool(const char *key, bool value);
+ 	void publish(unsigned percent, unsigned mv, int ma, bool external,
+-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
++	    bool capable, bool charging, bool full, bool measured, bool currentValid,
++	    bool notify = true);
++	void publishFallback(void);
+ 	void poll(void);
++	bool pollS9(void);
++	void s9Charge(const struct s9_battery_regs *r);
++	static bool s9Word(uint8_t reg, uint16_t *out);
++	static bool s9Read(struct s9_battery_regs *r);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+ 	static bool readWord(unsigned address, uint16_t *value);
+@@ -40,6 +121,29 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+ 
++static int
++sysctl_sweet_charge SYSCTL_HANDLER_ARGS
++{
++	(void)oidp;
++	(void)arg1;
++	(void)arg2;
++	int v = sweet_charge_mode, changed = 0;
++	int error = sysctl_io_number(req, v, sizeof(v), &v, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	if (v != 1 && v != 2) {
++		return EINVAL;
++	}
++	sweet_charge_request = v;       /* the polling thread owns the bus and the checks */
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_charge, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_charge, "I", "S9: 1 = turn MAX77705 charging on (checked, as Linux does), 2 = off; 0 = untouched");
++SYSCTL_STRING(_kern, OID_AUTO, sweet_battery, CTLFLAG_RD | CTLFLAG_LOCKED,
++    sweet_battery_state, sizeof(sweet_battery_state), "S9: last fuel gauge and charger reading");
++
+ bool
+ SweetBattery::init(OSDictionary *dictionary)
+ {
+@@ -51,7 +155,9 @@ SweetBattery::init(OSDictionary *dictionary)
+ 	}
+ 	fLoop = NULL;
+ 	fTimer = NULL;
+-	fTimerAdded = fRunning = fReal = false;
++	fTimerAdded = fRunning = fReal = fS9 = fS9Good = fBound = false;
++	fLastDtls1 = fLastIntOk = fLastCnfg00 = 0xff;
++	fS9Errors = 0;
+ 	if (dictionary) {
+ 		OSCollectionIterator *it = OSCollectionIterator::withCollection(dictionary);
+ 		if (!it) {
+@@ -99,7 +205,7 @@ SweetBattery::putBool(const char *key, bool value)
+ 
+ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+-    bool capable, bool charging, bool full, bool measured, bool currentValid)
++    bool capable, bool charging, bool full, bool measured, bool currentValid, bool notify)
+ {
+ 	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
+ 	const unsigned capacity = (5020u * percent + 50u) / 100u;
+@@ -150,16 +256,44 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 		setLegacyIOBatteryInfo(legacy);
+ 		legacy->release();
+ 	}
+-	updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
++	if (notify) {
++		updateStatus(); /* Flush PS properties and send 0xe0024100 on change. */
++	}
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? (fS9 ? "MAX77705 fuel gauge" : "PM6150 / estimated SOC") : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+ }
+ 
++/*
++ * Galaxy S9 with no gauge reading: the phone lives on the USB cable for its
++ * network, so report charging (the status bar bolt; not measured).
++ */
++void
++SweetBattery::publishFallback(void)
++{
++	publish(100, 4200, 500, true, true, true, false, false, false);
++	/* A charger to show charging for: a 5 V USB port, as a PC's (not measured either). */
++	OSDictionary *adapter = OSDictionary::withCapacity(4);
++	OSNumber *watts = OSNumber::withNumber(5ULL, 32);
++	OSNumber *family = OSNumber::withNumber(0xe000400aULL, 32);
++	const OSSymbol *key = OSSymbol::withCString("AdapterDetails");
++	if (adapter && watts && family && key) {
++		adapter->setObject("Watts", watts);
++		adapter->setObject("FamilyCode", family);
++		adapter->setObject("IsWireless", kOSBooleanFalse);
++		setPSProperty(key, adapter);
++		updateStatus();
++	}
++	OSSafeReleaseNULL(key);
++	OSSafeReleaseNULL(family);
++	OSSafeReleaseNULL(watts);
++	OSSafeReleaseNULL(adapter);
++}
++
+ /* Keep the proven single-byte observer command. Read two matching whole
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+@@ -203,9 +337,172 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/* One 16-bit fuel gauge register, low byte first. */
++bool
++SweetBattery::s9Word(uint8_t reg, uint16_t *out)
++{
++	uint8_t b[2];
++	if (sweet_max77705_read(S9_FG, reg, b, 2) != 0) {
++		return false;
++	}
++	*out = (uint16_t)(b[0] | (b[1] << 8));
++	return true;
++}
++
++bool
++SweetBattery::s9Read(struct s9_battery_regs *r)
++{
++	uint16_t cur, avg;
++	bool ok = s9Word(S9_FG_STATUS, &r->status) && s9Word(S9_FG_REPSOC, &r->repsoc) &&
++	    s9Word(S9_FG_VCELL, &r->vcell) && s9Word(S9_FG_CURRENT, &cur) &&
++	    s9Word(S9_FG_AVGCURRENT, &avg) && s9Word(S9_FG_REPCAP, &r->repcap) &&
++	    s9Word(S9_FG_FULLCAPREP, &r->fullcaprep) && s9Word(S9_FG_CYCLES, &r->cycles) &&
++	    s9Word(S9_FG_DESIGNCAP, &r->designcap) && s9Word(S9_FG_TTE, &r->tte) &&
++	    s9Word(S9_FG_TTF, &r->ttf);
++	r->current = (int16_t)cur;
++	r->avgcurrent = (int16_t)avg;
++	ok = ok && sweet_max77705_read(S9_CHG, S9_CHG_INT_OK, &r->int_ok, 1) == 0 &&
++	    sweet_max77705_read(S9_CHG, S9_CHG_DETAILS_00, &r->dtls0, 1) == 0 &&
++	    sweet_max77705_read(S9_CHG, S9_CHG_DETAILS_01, &r->dtls1, 1) == 0 &&
++	    sweet_max77705_read(S9_CHG, S9_CHG_DETAILS_02, &r->dtls2, 1) == 0 &&
++	    sweet_max77705_read(S9_CHG, S9_CHG_CNFG_00, &r->cnfg00, 1) == 0 &&
++	    sweet_max77705_read(S9_CHG, S9_CHG_CNFG_02, &r->cnfg02, 1) == 0 &&
++	    sweet_max77705_read(S9_CHG, S9_CHG_CNFG_04, &r->cnfg04, 1) == 0 &&
++	    sweet_max77705_read(S9_CHG, S9_CHG_CNFG_09, &r->cnfg09, 1) == 0;
++	return ok;
++}
++
++/*
++ * The charge switch, from the polling thread (it owns the bus): a request
++ * from the sysctl, or the automatic turn-off of charging we turned on.
++ */
++void
++SweetBattery::s9Charge(const struct s9_battery_regs *r)
++{
++	unsigned mv = (unsigned)(((uint64_t)r->vcell * 78125) / 1000000);
++	unsigned cv = (r->cnfg04 & 0x3f) <= 4 ? 4000 + 50 * (r->cnfg04 & 0x3f) : 4200 + 10 * ((r->cnfg04 & 0x3f) - 4);
++	int request = sweet_charge_request;
++	sweet_charge_request = -1;
++
++	if (sweet_charge_mode == 1 && mv >= 4360) {
++		request = 2;
++		IOLog("SWEET BATTERY: cell at %u mV, turning the charging we enabled off\n", mv);
++	}
++	if (request == 1) {
++		if ((r->status & (1u << 3)) || !(r->int_ok & S9_CHGIN_OK) || mv >= 4300 ||
++		    (r->cnfg04 & 0x3f) > S9_CV_4350MV || !(r->cnfg00 & S9_CNFG00_BUCK)) {
++			IOLog("SWEET BATTERY: charging NOT enabled (battery %s, CHGIN %s, %u mV, float %u mV, CNFG_00 0x%02x)\n",
++			    (r->status & (1u << 3)) ? "absent" : "ok", (r->int_ok & S9_CHGIN_OK) ? "ok" : "absent",
++			    mv, cv, r->cnfg00);
++			return;
++		}
++		/* Unlock the protected charger settings (CHGPROT = 11), as max77705_charger_unlock. */
++		uint8_t cnfg06 = 0;
++		(void)sweet_max77705_read(S9_CHG, S9_CHG_CNFG_06, &cnfg06, 1);
++		const uint8_t unlock[2] = { S9_CHG_CNFG_06, (uint8_t)(cnfg06 | (3u << 2)) };
++		const uint8_t en09[2] = { S9_CHG_CNFG_09, (uint8_t)(r->cnfg09 | S9_CNFG09_CHG_EN) };
++		const uint8_t on00[2] = { S9_CHG_CNFG_00, (uint8_t)(r->cnfg00 | S9_CNFG00_CHG) };
++		int err = sweet_max77705_write(S9_CHG, unlock, 2);
++		if (!err) {
++			err = sweet_max77705_write(S9_CHG, en09, 2);
++		}
++		if (!err) {
++			err = sweet_max77705_write(S9_CHG, on00, 2);
++		}
++		sweet_charge_mode = err ? sweet_charge_mode : 1;
++		IOLog("SWEET BATTERY: charging on (%d): CNFG_00 0x%02x -> 0x%02x, CNFG_09 0x%02x -> 0x%02x, float %u mV\n",
++		    err, r->cnfg00, on00[1], r->cnfg09, en09[1], cv);
++	} else if (request == 2) {
++		const uint8_t off00[2] = { S9_CHG_CNFG_00, (uint8_t)(r->cnfg00 & ~S9_CNFG00_CHG) };
++		int err = sweet_max77705_write(S9_CHG, off00, 2);
++		sweet_charge_mode = err ? sweet_charge_mode : 2;
++		IOLog("SWEET BATTERY: charging off (%d): CNFG_00 0x%02x -> 0x%02x\n", err, r->cnfg00, off00[1]);
++	}
++}
++
++/* Galaxy S9: one MAX77705 reading; false if the gauge did not answer sanely. */
++bool
++SweetBattery::pollS9(void)
++{
++	struct s9_battery_regs r = {};
++	if (!s9Read(&r)) {
++		if (++fS9Errors == 3 && sweet_charge_mode == 1) {
++			sweet_charge_request = 2;       /* best effort: the next good poll turns it off */
++		}
++		return false;
++	}
++	fS9Errors = 0;
++	unsigned mv = (unsigned)(((uint64_t)r.vcell * 78125) / 1000000);
++	unsigned soc10 = (r.repsoc >> 8) * 10 + ((r.repsoc & 0xff) * 10) / 256;
++	if ((r.status & (1u << 3)) || mv < 2800 || mv > 4600 || soc10 > 1010) {
++		snprintf(sweet_battery_state, sizeof(sweet_battery_state),
++		    "invalid: status=0x%04x vcell=%u mV repsoc=0x%04x", r.status, mv, r.repsoc);
++		return false;
++	}
++	s9Charge(&r);
++	int ma = (int)(((int64_t)r.avgcurrent * 3125) / 10000);         /* 312.5 uA */
++	int ima = (int)(((int64_t)r.current * 3125) / 10000);
++	unsigned dtls = r.dtls1 & 0x0f;
++	bool external = (r.int_ok & S9_CHGIN_OK) != 0;
++	bool enabled = (r.cnfg00 & S9_CNFG00_CHG) && (r.cnfg09 & S9_CNFG09_CHG_EN);
++	bool charging = external && dtls <= 2;
++	bool full = external && (dtls == 3 || dtls == 4);
++	unsigned percent = full ? 100 : (soc10 + 5) / 10;
++	percent = percent > 100 ? 100 : percent;
++	unsigned input = (r.cnfg09 & 0x7f) <= 3 ? 100 : ((r.cnfg09 & 0x7f) + 1) * 25;
++
++	publish(percent, mv, ma, external, external && enabled, charging, full, true, true, false);
++	/* Real gauge numbers on top of the generic ones publish() writes. */
++	if (r.fullcaprep > 0) {
++		setMaxCapacity(r.fullcaprep);
++		setCurrentCapacity((r.fullcaprep * percent + 50) / 100);
++		putNumber("AppleRawMaxCapacity", r.fullcaprep);
++	}
++	putNumber("AppleRawCurrentCapacity", r.repcap);
++	if (r.designcap > 0) {
++		putNumber("DesignCapacity", r.designcap);
++	}
++	putNumber("InstantAmperage", (UInt32)ima);
++	setCycleCount(r.cycles / 100);
++	unsigned minutes = (unsigned)-1;
++	uint16_t t = charging ? r.ttf : r.tte;
++	if (t != 0xffff && t != 0 && (charging || ma < 0)) {
++		minutes = (unsigned)(((uint64_t)t * 5625) / 60000);
++	}
++	setTimeRemaining(minutes == (unsigned)-1 ? -1 : (int)minutes);
++	/* A measured level may warn (low battery alert); critical (powerd's shutdown) stays off. */
++	setAtWarnLevel(!external && percent <= 10);
++	putBool("SweetBatteryTemperatureEstimated", true);
++	updateStatus();
++
++	snprintf(sweet_battery_state, sizeof(sweet_battery_state),
++	    "soc=%u.%u%% vcell=%umV avg=%dmA now=%dmA rep=%u/%umAh design=%umAh cycles=%u.%02u "
++	    "chgin=%d dtls=0x%x bat=%u cnfg00=0x%02x cnfg09=0x%02x(in %umA en %d) cc=%umA charge_mode=%d",
++	    soc10 / 10, soc10 % 10, mv, ma, ima, r.repcap, r.fullcaprep, r.designcap, r.cycles / 100,
++	    r.cycles % 100, external, dtls, (r.dtls1 >> 4) & 7, r.cnfg00, r.cnfg09, input,
++	    (r.cnfg09 & S9_CNFG09_CHG_EN) != 0, (r.cnfg02 & 0x3f) <= 2 ? 100 : (r.cnfg02 & 0x3f) * 50,
++	    sweet_charge_mode);
++	if (r.dtls1 != fLastDtls1 || r.int_ok != fLastIntOk || r.cnfg00 != fLastCnfg00) {
++		IOLog("SWEET BATTERY: %s\n", sweet_battery_state);
++		fLastDtls1 = r.dtls1;
++		fLastIntOk = r.int_ok;
++		fLastCnfg00 = r.cnfg00;
++	}
++	return true;
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fS9) {
++		/* A failed reading keeps the last good one; the fallback only until the first. */
++		if (pollS9()) {
++			fS9Good = true;
++		} else if (!fS9Good) {
++			publishFallback();
++		}
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&
+@@ -221,28 +518,7 @@ SweetBattery::poll(void)
+ 	/* Zero, reset, floating, or implausible data cannot become 0% battery. */
+ 	valid = valid && mv >= 2800 && mv <= 4600;
+ 	if (!valid) {
+-		/*
+-		 * Galaxy S9: no gauge read yet (its fuel gauge is in the MAX77705, on
+-		 * I2C), and the phone lives on the USB cable for its network: report
+-		 * charging, so the status bar shows the bolt (not measured).
+-		 */
+-		publish(100, 4200, 500, true, true, true, false, false, false);
+-		/* A charger to show charging for: a 5 V USB port, as a PC's (not measured either). */
+-		OSDictionary *adapter = OSDictionary::withCapacity(4);
+-		OSNumber *watts = OSNumber::withNumber(5ULL, 32);
+-		OSNumber *family = OSNumber::withNumber(0xe000400aULL, 32);
+-		const OSSymbol *key = OSSymbol::withCString("AdapterDetails");
+-		if (adapter && watts && family && key) {
+-			adapter->setObject("Watts", watts);
+-			adapter->setObject("FamilyCode", family);
+-			adapter->setObject("IsWireless", kOSBooleanFalse);
+-			setPSProperty(key, adapter);
+-			updateStatus();
+-		}
+-		OSSafeReleaseNULL(key);
+-		OSSafeReleaseNULL(family);
+-		OSSafeReleaseNULL(watts);
+-		OSSafeReleaseNULL(adapter);
++		publishFallback();
+ 		return;
+ 	}
+ 	bool external = (usb & 0x10u) != 0;
+@@ -272,8 +548,12 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+ 	SweetBattery *self = OSDynamicCast(SweetBattery, owner);
+ 	if (self && self->fRunning) {
++		if (self->fS9 && !self->fBound) {
++			self->fBound = true;
++			IOLog("SWEET BATTERY: polling on cpu %d\n", sweet_bind_current_thread(S9_BATTERY_CPU));
++		}
+ 		self->poll();
+-		sender->setTimeoutMS(30000);
++		sender->setTimeoutMS(self->fS9 ? S9_POLL_MS : 30000);
+ 	}
+ }
+ 
+@@ -283,9 +563,18 @@ SweetBattery::start(IOService *provider)
+ 	if (!IOPMPowerSource::start(provider)) {
+ 		return false;
+ 	}
+-	int real = 0;
++	/* Galaxy S9: the MAX77705 gauge unless sweetbattery=0 (static) or 1 (PM6150, the Redmi). */
++	int real = 2;
+ 	(void)PE_parse_boot_argn("sweetbattery", &real, sizeof(real));
+-	fReal = real == 1 && sweet_spmi_init() == 0;
++	if (real == 2) {
++		uint16_t status;
++		fS9 = s9Word(S9_FG_STATUS, &status);
++		fReal = fS9;
++		IOLog("SWEET BATTERY: MAX77705 fuel gauge %s (status 0x%04x)\n",
++		    fS9 ? "answers" : "does NOT answer: static fallback", fS9 ? status : 0);
++	} else {
++		fReal = real == 1 && sweet_spmi_init() == 0;
++	}
+ 	/* Publish a complete source BEFORE registerService wakes powerd. */
+ 	poll();
+ 	if (fReal) {
+@@ -294,9 +583,9 @@ SweetBattery::start(IOService *provider)
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
+ 			fRunning = true;
+-			fTimer->setTimeoutMS(30000);
++			fTimer->setTimeoutMS(fS9 ? S9_POLL_MS : 30000);
+ 		} else {
+-			fReal = false;
++			fReal = fS9 = false;
+ 			poll();
+ 			IOLog("SWEET BATTERY: timer unavailable; static fallback\n");
+ 		}
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6875c7d..6635ad6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -271,6 +271,13 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	/* Swap ids (fLock): last SwapEnd, last shown, flip handed to the SDE and not yet taken. */
+ 	uint32_t                fEndedID, fPresentedID, fPendingFlipID;
+ 	int32_t                 fDirtyY0, fDirtyY1;     /* canvas rows changed since the last copy (fLock) */
++	/*
++	 * Galaxy S9: the dirty rectangles of this stats window, most frequent
++	 * kept (fLock), so the fps line says what keeps the screen busy (the
++	 * 24 fps animation with nothing touched), and how many swaps were full.
++	 */
++	struct { int32_t x, y, w, h; uint32_t n; } fRegions[4];
++	uint32_t                fFullSwaps, fNoRegionSwaps;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static void presentFired(OSObject *owner, IOInterruptEventSource *sender, int count);
+@@ -702,10 +709,22 @@ AppleCLCD::presentPending(void)
+ 			absolutetime_to_nanoseconds(mach_absolute_time() - fStatsStart, &span);
+ 			/* fps over the window; idle gaps (nothing to draw) count, so it is a lower bound */
+ 			uint64_t fps10 = 3000000000000ULL / (span ? span : 1);
++			IOLockLock(fLock);
++			unsigned top = 0;
++			for (unsigned k = 1; k < 4; k++) {
++				if (fRegions[k].n > fRegions[top].n) {
++					top = k;
++				}
++			}
++			int32_t tx = fRegions[top].x, ty = fRegions[top].y, tw = fRegions[top].w, th = fRegions[top].h;
++			uint32_t tn = fRegions[top].n, full = fFullSwaps, none = fNoRegionSwaps;
++			bzero(fRegions, sizeof(fRegions));
++			fFullSwaps = fNoRegionSwaps = 0;
++			IOLockUnlock(fLock);
+ 			IOLog("SWEET FB: present avg %llu us max %llu us, 300 frames in %llu ms (%llu.%llu fps), "
+-			    "%u flips %u copies, SwapWait %llu x %llu us\n",
++			    "%u flips %u copies, SwapWait %llu x %llu us; swaps: %u full, %u no region, top %d,%d %dx%d x%u\n",
+ 			    fPresentNs / 300000, fPresentMaxNs / 1000, span / 1000000, fps10 / 10, fps10 % 10,
+-			    fFlipsWin, fCopiesWin, waits, waits ? waitNs / waits / 1000 : 0);
++			    fFlipsWin, fCopiesWin, waits, waits ? waitNs / waits / 1000 : 0, full, none, tx, ty, tw, th, tn);
+ 			fPresentCount = 0;
+ 			fPresentNs = fPresentMaxNs = 0;
+ 			fFlipsWin = fCopiesWin = 0;
+@@ -791,6 +810,35 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	/* Every display slot must catch up with these rows before it is shown again. */
+ 	sweet_surface_slots_dirty(part ? y0 : -1, part ? y1 : -1);
+ 	IOLockLock(fLock);
++	if (!part) {
++		fNoRegionSwaps++;
++	} else {
++		int32_t rx = (int32_t)get32(rec, 0x250), ry = (int32_t)get32(rec, 0x254);
++		int32_t rw = (int32_t)get32(rec, 0x258), rh = (int32_t)get32(rec, 0x25c);
++		if (rw >= (int32_t)fLogicalW && rh >= (int32_t)fLogicalH) {
++			fFullSwaps++;
++		} else {
++			unsigned k = 0, low = 0;
++			for (; k < 4; k++) {
++				if (fRegions[k].n != 0 && fRegions[k].x == rx && fRegions[k].y == ry &&
++				    fRegions[k].w == rw && fRegions[k].h == rh) {
++					break;
++				}
++				if (fRegions[k].n < fRegions[low].n) {
++					low = k;
++				}
++			}
++			if (k == 4) {   /* a new rectangle replaces the rarest one */
++				k = low;
++				fRegions[k].x = rx;
++				fRegions[k].y = ry;
++				fRegions[k].w = rw;
++				fRegions[k].h = rh;
++				fRegions[k].n = 0;
++			}
++			fRegions[k].n++;
++		}
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	fEndedID = id;
+@@ -1372,7 +1420,7 @@ IOMobileFramebufferUserClient::notify(uint32_t type, const uint64_t *values, uin
+ 	    kIOUserNotifyOptionCanDrop);
+ }
+ 
+-static uint64_t sweet_fb_logged;        /* selectors already logged (< 64) */
++static uint64_t sweet_fb_logged[2];     /* selectors already logged (< 128) */
+ 
+ IOReturn
+ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+@@ -1458,9 +1506,9 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
+-	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+-		if (selector < 64) {
+-			sweet_fb_logged |= 1ULL << selector;
++	if (selector >= 128 || !(sweet_fb_logged[selector / 64] & (1ULL << (selector % 64)))) {
++		if (selector < 128) {
++			sweet_fb_logged[selector / 64] |= 1ULL << (selector % 64);
+ 		}
+ 		char name[32];
+ 		proc_selfname(name, sizeof(name));
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index 6156790..e99031f 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -15,6 +15,11 @@
+  * console, plus the first failures; unknown ones fail with
+  * kIOReturnUnsupported. (Logging every call cost CPU: see wrap/unwrap.)
+  *
++ * Galaxy S9: lock device (8, and 32 = now): SpringBoard locks the keybag
++ * whenever the screen locks (MKBLockDevice -> aks_lock_device); with no
++ * passcode there is nothing to lock, so it succeeds (it failed with
++ * kIOReturnUnsupported, 25-30 times a boot).
++ *
+  * Galaxy S9: wrap/unwrap (10/11). securityd wraps the keychain's metadata
+  * keys with aks_wrap_key; answered "unsupported" it retried forever, ~300
+  * calls a second, ~80 % of a core plus launchd's share. Without a SEP there
+@@ -41,6 +46,7 @@ enum {
+ 	kAKSSetSystem        = 5,
+ 	kAKSLoadBag          = 6,
+ 	kAKSGetLockState     = 7,
++	kAKSLockDevice       = 8,       /* aks_lock_device(handle, now = false) */
+ 	kAKSUnlockDevice     = 9,
+ 	kAKSWrapKey          = 10,
+ 	kAKSUnwrapKey        = 11,
+@@ -51,6 +57,7 @@ enum {
+ 	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
+ 	kAKSAssertHold       = 26,
+ 	kAKSAssertDrop       = 27,
++	kAKSLockDeviceNow    = 32,      /* aks_lock_device(handle, now = true) */
+ 	kAKSUnloadSessionBags = 55,
+ 	kAKSNotifyStateSet   = 102,
+ 	kAKSNotifyStateIsSet = 103,
+@@ -231,7 +238,7 @@ sweet_aks_unwrap(IOExternalMethodArguments *args)
+ 	return ret;
+ }
+ 
+-static uint64_t sweet_aks_logged;       /* selectors already logged (< 64) */
++static uint64_t sweet_aks_logged[2];    /* selectors already logged (< 128) */
+ static uint32_t sweet_aks_failures_logged;
+ 
+ static uint32_t
+@@ -259,6 +266,8 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 	case kAKSUnloadBag:
+ 	case kAKSSetSystem:
+ 	case kAKSUnlockDevice:
++	case kAKSLockDevice:
++	case kAKSLockDeviceNow:
+ 	case kAKSUnlockBag:
+ 	case kAKSLockBag:
+ 	case kAKSAssertHold:
+@@ -309,10 +318,10 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		break;
+ 	}
+ 
+-	bool first = selector >= 64 || !(sweet_aks_logged & (1ULL << selector));
++	bool first = selector >= 128 || !(sweet_aks_logged[selector / 64] & (1ULL << (selector % 64)));
+ 	if (first || (ret != kIOReturnSuccess && sweet_aks_failures_logged < 32)) {
+-		if (selector < 64) {
+-			sweet_aks_logged |= 1ULL << selector;
++		if (selector < 128) {
++			sweet_aks_logged[selector / 64] |= 1ULL << (selector % 64);
+ 		}
+ 		if (ret != kIOReturnSuccess) {
+ 			sweet_aks_failures_logged++;
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index aeac3c1..232e771 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -39,6 +39,7 @@
+ #include <libkern/c++/OSNumber.h>
+ #include <libkern/c++/OSUnserialize.h>
+ #include <sys/proc.h>
++#include <sys/sysctl.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -73,6 +74,14 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
++/* Galaxy S9: trap and creation counters, read with sysctl (per frame: divide by kern.sweetfb_swaps). */
++static uint64_t      sweet_surface_locks, sweet_surface_creates, sweet_surface_create_bytes;
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_surface_locks, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_surface_locks,
++    "S9: IOSurface lock + unlock traps");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_surface_creates, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_surface_creates,
++    "S9: IOSurfaces created");
++SYSCTL_QUAD(_kern, OID_AUTO, sweet_surface_create_bytes, CTLFLAG_RD | CTLFLAG_LOCKED, &sweet_surface_create_bytes,
++    "S9: bytes of IOSurfaces created (each one zeroed)");
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
+ 
+ /* Galaxy S9: display slots (sweet_surface_set_display_slots), under sweet_surface_lock. */
+@@ -503,8 +512,19 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	task_t   fTask;
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
++	/*
++	 * Galaxy S9: fRefs by surface id, open addressing (fLock). CoreAnimation
++	 * locks and unlocks the IOSurface of every texture it draws, a trap each;
++	 * a linear search of backboardd's hundreds of surfaces per trap cost
++	 * microseconds of the render thread every time.
++	 */
++	SweetSurfaceRef **fMap;
++	uint32_t fMapCap, fMapUsed;
+ 
+ 	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
++	bool mapInsert(SweetSurfaceRef *ref);
++	void mapRemove(uint32_t id);
++	SweetSurface *heldSurface(uint32_t id);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+@@ -550,13 +570,19 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt3
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
+ 	fRefs = OSArray::withCapacity(16);
+-	return fLock != NULL && fRefs != NULL;
++	fMapCap = 64;
++	fMap = (SweetSurfaceRef **)IOMallocZero(fMapCap * sizeof(fMap[0]));
++	return fLock != NULL && fRefs != NULL && fMap != NULL;
+ }
+ 
+ void
+ IOSurfaceRootUserClient::free()
+ {
+ 	OSSafeReleaseNULL(fRefs);
++	if (fMap != NULL) {
++		IOFree(fMap, fMapCap * sizeof(fMap[0]));
++		fMap = NULL;
++	}
+ 	if (fLock != NULL) {
+ 		IOLockFree(fLock);
+ 		fLock = NULL;
+@@ -569,20 +595,26 @@ IOSurfaceRootUserClient::clientClose(void)
+ {
+ 	IOLockLock(fLock);
+ 	fRefs->flushCollection();
++	bzero(fMap, fMapCap * sizeof(fMap[0]));
++	fMapUsed = 0;
+ 	IOLockUnlock(fLock);
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+ 
+-/* Lock held. */
++/* Lock held. The fRefs index too only when asked (a release: rare). */
+ SweetSurfaceRef *
+ IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
+ {
+-	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+-		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
++	uint32_t mask = fMapCap - 1;
++	for (uint32_t i = id & mask, n = 0; n < fMapCap; i = (i + 1) & mask, n++) {
++		SweetSurfaceRef *ref = fMap[i];
++		if (ref == NULL) {
++			break;
++		}
+ 		if (ref->surface->id == id) {
+ 			if (index != NULL) {
+-				*index = i;
++				*index = fRefs->getNextIndexOfObject(ref, 0);
+ 			}
+ 			return ref;
+ 		}
+@@ -590,6 +622,67 @@ IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
+ 	return NULL;
+ }
+ 
++/* Lock held. Surface ids are unique among a client's refs (each ref is a user of its id). */
++bool
++IOSurfaceRootUserClient::mapInsert(SweetSurfaceRef *ref)
++{
++	if ((fMapUsed + 1) * 2 > fMapCap) {
++		uint32_t cap = fMapCap * 2;
++		SweetSurfaceRef **map = (SweetSurfaceRef **)IOMallocZero(cap * sizeof(map[0]));
++		if (map == NULL) {
++			return false;
++		}
++		for (uint32_t i = 0; i < fMapCap; i++) {
++			SweetSurfaceRef *r = fMap[i];
++			if (r != NULL) {
++				uint32_t j = r->surface->id & (cap - 1);
++				while (map[j] != NULL) {
++					j = (j + 1) & (cap - 1);
++				}
++				map[j] = r;
++			}
++		}
++		IOFree(fMap, fMapCap * sizeof(fMap[0]));
++		fMap = map;
++		fMapCap = cap;
++	}
++	uint32_t mask = fMapCap - 1, i = ref->surface->id & mask;
++	while (fMap[i] != NULL) {
++		i = (i + 1) & mask;
++	}
++	fMap[i] = ref;
++	fMapUsed++;
++	return true;
++}
++
++/* Lock held. Backward-shift deletion keeps every probe chain unbroken. */
++void
++IOSurfaceRootUserClient::mapRemove(uint32_t id)
++{
++	uint32_t mask = fMapCap - 1, i = id & mask, n = 0;
++	while (fMap[i] != NULL && fMap[i]->surface->id != id) {
++		i = (i + 1) & mask;
++		if (++n == fMapCap) {
++			return;
++		}
++	}
++	if (fMap[i] == NULL) {
++		return;
++	}
++	fMap[i] = NULL;
++	fMapUsed--;
++	for (uint32_t j = (i + 1) & mask; fMap[j] != NULL; j = (j + 1) & mask) {
++		uint32_t home = fMap[j]->surface->id & mask;
++		/* fMap[j] may move to the hole at i unless its home lies cyclically in (i, j]. */
++		bool stays = (i < j) ? (home > i && home <= j) : (home > i || home <= j);
++		if (!stays) {
++			fMap[i] = fMap[j];
++			fMap[j] = NULL;
++			i = j;
++		}
++	}
++}
++
+ /*
+  * Count one more create/lookup of s by this client, mapping it into the
+  * task the first time. Takes over the caller's user count on s.
+@@ -641,6 +734,11 @@ IOSurfaceRootUserClient::addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool
+ 		*refOut = raced;
+ 		return kIOReturnSuccess;
+ 	}
++	if (!mapInsert(ref)) {
++		IOLockUnlock(fLock);
++		ref->release();
++		return kIOReturnNoMemory;
++	}
+ 	fRefs->setObject(ref);
+ 	IOLockUnlock(fLock);
+ 	ref->release();         /* fRefs holds it */
+@@ -832,6 +930,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			}
+ 		}
+ 	}
++	if (ret == kIOReturnSuccess) {
++		OSIncrementAtomic64((volatile SInt64 *)&sweet_surface_creates);
++		OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_create_bytes);
++	}
+ 	if (ret != kIOReturnSuccess || sweet_surface_creates_logged < 64 || slot >= 0) {
+ 		sweet_surface_creates_logged++;
+ 		IOLog("SWEET SURF: %s create id %u %ux%u fmt 0x%x bpe %u bpr %u planes %u size %u keys %u slot %d -> 0x%x\n",
+@@ -931,20 +1033,17 @@ sweet_surface_seed_out(SweetSurface *s, void *seedOut, bool bump)
+ }
+ 
+ /* Retained surface this client created or looked up, or NULL. */
+-static SweetSurface *
+-sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
++SweetSurface *
++IOSurfaceRootUserClient::heldSurface(uint32_t id)
+ {
+ 	SweetSurface *s = NULL;
+-	IOLockLock(lock);
+-	for (unsigned int i = 0; i < refs->getCount(); i++) {
+-		SweetSurfaceRef *ref = (SweetSurfaceRef *)refs->getObject(i);
+-		if (ref->surface->id == id) {
+-			s = ref->surface;
+-			s->retain();
+-			break;
+-		}
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef(id, NULL);
++	if (ref != NULL) {
++		s = ref->surface;
++		s->retain();
+ 	}
+-	IOLockUnlock(lock);
++	IOLockUnlock(fLock);
+ 	return s;
+ }
+ 
+@@ -952,7 +1051,8 @@ IOReturn
+ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
+     void *, void *, void *)
+ {
+-	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	SweetSurface *s = heldSurface((uint32_t)(uintptr_t)id);
++	OSIncrementAtomic64((volatile SInt64 *)&sweet_surface_locks);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+@@ -965,7 +1065,8 @@ IOReturn
+ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+     void *, void *, void *)
+ {
+-	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
++	SweetSurface *s = heldSurface((uint32_t)(uintptr_t)id);
++	OSIncrementAtomic64((volatile SInt64 *)&sweet_surface_locks);
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+@@ -982,6 +1083,7 @@ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, v
+ 	IOLockLock(fLock);
+ 	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
+ 	if (ref != NULL && --ref->count == 0) {
++		mapRemove(ref->surface->id);
+ 		fRefs->removeObject(index);     /* unmaps and drops the user count */
+ 	}
+ 	IOLockUnlock(fLock);
+diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
+index b082a10..9e19fed 100644
+--- a/osfmk/arm64/cpu.c
++++ b/osfmk/arm64/cpu.c
+@@ -151,6 +151,20 @@ static uint32_t idle_proximate_timer_wfe = 1;
+ static uint32_t idle_proximate_io_wfe_masked = 0;
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Galaxy S9: an idle core only executes WFI here (no PSCI CPU_SUSPEND, cores
++ * are never powered down), and WFI keeps the caches powered and coherent.
++ * The L1 clean+invalidate by set/way that platform_cache_idle_enter() does
++ * before every WFI is therefore pure cost: time on the way to sleep and a
++ * cold cache on wake-up, thousands of times a second while CoreAnimation's
++ * dispatch_apply helpers park and wake around every polygon. boot-arg
++ * sweetidleflush=1 (or sysctl kern.sweet_idle_flush=1) restores it.
++ */
++extern int sweet_idle_flush;
++int sweet_idle_flush = 0;
++#endif
++
+ #if __ARM_GLOBAL_SLEEP_BIT__
+ volatile boolean_t arm64_stall_sleep = TRUE;
+ #endif
+@@ -569,8 +583,14 @@ cpu_idle(void)
+ 
+ 	if (wfi) {
+ #if !defined(APPLE_ARM64_ARCH_FAMILY)
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (sweet_idle_flush) {
++			platform_cache_idle_enter();
++		}
++#else
+ 		platform_cache_idle_enter();
+ #endif
++#endif
+ 
+ #if DEVELOPMENT || DEBUG
+ 		// When simulating wfi overhead,
+@@ -1185,6 +1205,10 @@ cpu_machine_idle_init(boolean_t from_boot)
+ 		}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		PE_parse_boot_argn("sweetidleflush", &sweet_idle_flush, sizeof(sweet_idle_flush));
++#endif
++
+ 		// bits 7..0 give the wfi type
+ 		switch (wfi & 0xff) {
+ 		case 0:
