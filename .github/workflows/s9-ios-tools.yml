@@ -31,6 +31,14 @@ jobs:
             codesign -f -s - --entitlements "$t.entitlements" "out/$t"
             codesign -d --entitlements - "out/$t"
           done
+          # measurement tools, read only: CPU per core and thread, memory speed, battery chain
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Werror s9top.c -o out/s9top
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -O2 -Wall -Werror s9membw.c -o out/s9membw
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -Wall -Werror \
+            -framework CoreFoundation -framework IOKit s9batt.c -o out/s9batt
+          for t in s9top s9membw s9batt; do
+            codesign -f -s - "out/$t"
+          done
           shasum -a 256 out/* > out/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
