@@ -9,6 +9,7 @@
 #   3. idle in Settings: CPU per thread, kernel fps line         ~25 s
 #   4. Settings scrolling: s9-bench + s9top side by side         ~30 s
 #   5. kern.sweet_idle_flush A/B/A (0, 1, 0)                     ~1.5 min
+#   5b. dispatch_apply width, kern.sweet_parallelism 1, 2, 4       ~1 min
 #   6. spindump of the scrolling (s9-profile.sh)                 ~1 min
 #   7. CoreAnimation's own counters (CA_PRINT_PERF)              ~1.5 min, restarts backboardd
 #   7b. CoreAnimation paced by the kernel's vsync (CA_FORCE_TIMER=1, which sets use_vbl)  ~1.5 min
@@ -136,6 +137,15 @@ bench base 4
 echo "== 5. idle flush A/B/A"
 ssh9 'sysctl -w kern.sweet_idle_flush=1' > /dev/null && bench flush1 4
 ssh9 'sysctl -w kern.sweet_idle_flush=0' > /dev/null && bench flush0 4
+
+echo "== 5b. dispatch_apply width (kern.sweet_parallelism 1, 2, 4; 0 = every core, the default)"
+# Every polygon asks the kernel for up to N-1 helper threads (a syscall,
+# wake-ups and IPIs), even a small one that the caller finishes alone: fewer
+# helpers may cost less than they save. 1 = no helpers at all.
+for p in 1 2 4; do
+	ssh9 "sysctl -w kern.sweet_parallelism=$p" > /dev/null && bench par$p 3
+done
+ssh9 'sysctl -w kern.sweet_parallelism=0' > /dev/null
 
 echo "== 6. spindump while scrolling"
 tools/s9-profile.sh "$out/prof-scroll" 8 > "$out/prof.txt" 2>&1
