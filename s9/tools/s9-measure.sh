@@ -187,4 +187,5 @@ ssh9 "cat $CAD/log.txt" > "$out/caenv-log.txt" 2>&1
 ssh9 "$B/s9batt" > "$out/batt-end.txt" 2>&1
 grep -h "kern.sweet_battery" "$out/batt-start.txt" "$out/batt-end.txt"
 grep -a "present avg" "$out/kernel.txt" | tail -40 > "$out/fps-lines.txt"
-ls -la "$out"
+python3 -I tools/s9-measure-report.py "$out" > "$out/report.md"
+cat "$out/report.md"
