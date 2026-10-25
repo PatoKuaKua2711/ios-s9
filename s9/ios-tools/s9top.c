@@ -1,9 +1,11 @@
 /*
  * s9top: CPU use per core and per thread on the Galaxy S9 iOS port (iOS ships
  * no top). Every interval it prints how busy each of the 8 cores was (cores
- * 0-3 are the Cortex-A55s, 4-7 the A75s) and, for every process named on the
- * command line, its threads sorted by CPU time used in that interval, with
- * their names and scheduling priority.
+ * 0-3 are the Cortex-A55s, 4-7 the A75s), the interrupts, inter-processor
+ * interrupts (IPIs: one core waking another, e.g. dispatch_apply helpers)
+ * and timer interrupts each core took per second, and, for every process
+ * named on the command line, its threads sorted by CPU time used in that
+ * interval, with their names and scheduling priority.
  *
  *   s9top [-i SECONDS] [-n COUNT] [-t THREADS] NAME [NAME...]
  *
@@ -111,6 +113,31 @@ sample_threads(struct proc *p)
 	}
 }
 
+/* Per-core interrupt counters (arm: PROCESSOR_CPU_STAT64, mach/arm/processor_info.h). */
+static int
+cpu_stats(natural_t *count, processor_cpu_stat64_t *info)
+{
+	mach_msg_type_number_t n = 0;
+	processor_info_array_t arr = NULL;
+	if (host_processor_info(mach_host_self(), PROCESSOR_CPU_STAT64, count, &arr, &n) != KERN_SUCCESS) {
+		return -1;
+	}
+	*info = (processor_cpu_stat64_t)arr;
+	return 0;
+}
+
+static void
+print_rates(const char *what, processor_cpu_stat64_t a, processor_cpu_stat64_t b, natural_t n, double secs, int field)
+{
+	printf("  %s/s:", what);
+	for (natural_t c = 0; c < n; c++) {
+		uint64_t x = field == 0 ? b[c].irq_ex_cnt - a[c].irq_ex_cnt :
+		    field == 1 ? b[c].ipi_cnt - a[c].ipi_cnt : b[c].timer_cnt - a[c].timer_cnt;
+		printf(" %s%.0f", c == 4 ? "| " : "", (double)x / secs);
+	}
+	printf("\n");
+}
+
 static int
 cpu_ticks(natural_t *count, processor_cpu_load_info_t *info)
 {
@@ -164,6 +191,9 @@ main(int argc, char **argv)
 		fprintf(stderr, "host_processor_info failed\n");
 		return 1;
 	}
+	natural_t nstat = 0;
+	processor_cpu_stat64_t s0 = NULL, s1 = NULL;
+	int have_stats = cpu_stats(&nstat, &s0) == 0;
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
 	uint64_t m0 = mach_absolute_time();
@@ -200,6 +230,16 @@ main(int argc, char **argv)
 		vm_deallocate(mach_task_self(), (vm_address_t)t0, ncpu * sizeof(*t0));
 		t0 = t1;
 		ncpu = n2;
+		natural_t ns2 = 0;
+		if (have_stats && cpu_stats(&ns2, &s1) == 0) {
+			natural_t nn = ns2 < nstat ? ns2 : nstat;
+			print_rates("irq", s0, s1, nn, secs, 0);
+			print_rates("ipi", s0, s1, nn, secs, 1);
+			print_rates("timer", s0, s1, nn, secs, 2);
+			vm_deallocate(mach_task_self(), (vm_address_t)s0, nstat * sizeof(*s0));
+			s0 = s1;
+			nstat = ns2;
+		}
 
 		for (int i = 0; i < nprocs; i++) {
 			after[i].pid = before[i].pid;

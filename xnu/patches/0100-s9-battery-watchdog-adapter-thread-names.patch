@@ -1,0 +1,300 @@
+diff --git a/bsd/dev/sweet_keys.c b/bsd/dev/sweet_keys.c
+index 3f529e8..36bf024 100644
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -16,6 +16,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ extern int sweet_bind_current_thread(int cpu);  /* osfmk/kern/sched_prim.c */
++extern void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
+ void sweet_keys_init(void);
+ 
+ #define KEYS_CORE_PA     0x0c440000u
+@@ -182,6 +183,7 @@ sweet_keys_init(void)
+ 	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet.keys");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET KEYS: kernel_thread_start failed %d\n", kr);
+diff --git a/bsd/dev/sweet_sample.c b/bsd/dev/sweet_sample.c
+index b40eccd..d20bb80 100644
+--- a/bsd/dev/sweet_sample.c
++++ b/bsd/dev/sweet_sample.c
+@@ -78,11 +78,14 @@ sweet_sample_thread(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ }
+ 
++extern void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
++
+ void
+ sweet_sample_start(void)
+ {
+ 	thread_t thread;
+ 	if (kernel_thread_start(sweet_sample_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet.sample");
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 2363102..4e086c7 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -412,6 +412,7 @@ touch_sects(void)
+ }
+ 
+ extern int sweet_bind_current_thread(int cpu);       /* osfmk/kern/sched_prim.c */
++extern void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
+ 
+ static void
+ touch_thread(void *arg, wait_result_t result)
+@@ -546,6 +547,7 @@ sysctl_sweet_swipe SYSCTL_HANDLER_ARGS
+ 		swipe_busy = 0;
+ 		return ENOMEM;
+ 	}
++	thread_set_thread_name(thread, "sweet.swipe");
+ 	thread_deallocate(thread);
+ 	return 0;
+ }
+@@ -622,6 +624,7 @@ sysctl_sweet_gesture SYSCTL_HANDLER_ARGS
+ 		swipe_busy = 0;
+ 		return ENOMEM;
+ 	}
++	thread_set_thread_name(thread, "sweet.gesture");
+ 	thread_deallocate(thread);
+ 	return 0;
+ }
+@@ -657,6 +660,7 @@ sweet_touch_init(void)
+ 	}
+ 	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet.touch");
+ 		thread_deallocate(thread);
+ 	} else {
+ 		printf("SWEET TOUCH: kernel_thread_start failed %d\n", kr);
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..328f786 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -46,6 +46,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ /* osfmk/arm/cpu_data.h, not exported to the BSD layer */
+ extern int get_preemption_level(void);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
+@@ -801,6 +802,7 @@ sweet_log_start(void)
+ 		sweet_log_secs = SWEET_LOG_SECS;
+ 	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet.log");
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 9ee059a..24c8f47 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -1372,6 +1372,7 @@ ud_restart(void)
+ }
+ 
+ extern int sweet_bind_current_thread(int cpu);       /* osfmk/kern/sched_prim.c */
++extern void thread_set_thread_name(thread_t th, const char *name);     /* osfmk/kern/thread.c */
+ 
+ static void
+ ud_thread(void *arg __unused, wait_result_t wr __unused)
+@@ -1480,11 +1481,13 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		return;
+ 	}
+ 	if (kernel_thread_start(ud_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet.usb");
+ 		thread_deallocate(thread);
+ 	}
+ 	int livelog = 1;
+ 	PE_parse_boot_argn("sweetusblog", &livelog, sizeof(livelog));
+ 	if (livelog && ud.ifp != NULL && kernel_thread_start(ud_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_set_thread_name(thread, "sweet.usblog");
+ 		thread_deallocate(thread);
+ 	}
+ }
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 6d6fa28..8e4cebc 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -34,6 +34,7 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
++#include <os/atomic_private.h>
+ #include <pexpert/pexpert.h>
+ #include <sys/sysctl.h>
+ #include <libkern/libkern.h>
+@@ -44,6 +45,7 @@ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ extern "C" int sweet_max77705_read(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n);
+ extern "C" int sweet_max77705_write(uint8_t addr, const uint8_t *buf, unsigned n);
+ extern "C" int sweet_bind_current_thread(int cpu);
++extern "C" void thread_set_thread_name(thread_t th, const char *name);  /* osfmk/kern/thread.c */
+ 
+ #define S9_FG                   0x36
+ #define S9_CHG                  0x69
+@@ -70,6 +72,9 @@ extern "C" int sweet_bind_current_thread(int cpu);
+ #define S9_CHGIN_OK             (1u << 6)
+ #define S9_CNFG00_CHG           (1u << 0)
+ #define S9_CNFG00_BUCK          (1u << 2)
++#define S9_CNFG00_WDTEN         (1u << 4)
++#define S9_CNFG06_CHGPROT       (3u << 2)       /* 11 = protected settings unlocked */
++#define S9_CNFG06_WDTCLR        0x01            /* bits 1:0 = 01 clears the charger watchdog */
+ #define S9_CNFG09_CHG_EN        0x80
+ #define S9_CV_4350MV            0x13    /* CNFG_04: 4200 + 10 * (code - 4) mV above 0x04 */
+ #define S9_BATTERY_CPU          2       /* an A55: the bit-banged reads spin (~16 ms a poll) */
+@@ -109,6 +114,7 @@ private:
+ 	    bool capable, bool charging, bool full, bool measured, bool currentValid,
+ 	    bool notify = true);
+ 	void publishFallback(void);
++	void publishAdapter(bool external, unsigned inputMa);
+ 	void poll(void);
+ 	bool pollS9(void);
+ 	void s9Charge(const struct s9_battery_regs *r);
+@@ -135,7 +141,8 @@ sysctl_sweet_charge SYSCTL_HANDLER_ARGS
+ 	if (v != 1 && v != 2) {
+ 		return EINVAL;
+ 	}
+-	sweet_charge_request = v;       /* the polling thread owns the bus and the checks */
++	/* The polling thread owns the bus and the checks; it takes the request atomically. */
++	os_atomic_store(&sweet_charge_request, v, relaxed);
+ 	return 0;
+ }
+ 
+@@ -381,8 +388,7 @@ SweetBattery::s9Charge(const struct s9_battery_regs *r)
+ {
+ 	unsigned mv = (unsigned)(((uint64_t)r->vcell * 78125) / 1000000);
+ 	unsigned cv = (r->cnfg04 & 0x3f) <= 4 ? 4000 + 50 * (r->cnfg04 & 0x3f) : 4200 + 10 * ((r->cnfg04 & 0x3f) - 4);
+-	int request = sweet_charge_request;
+-	sweet_charge_request = -1;
++	int request = os_atomic_xchg(&sweet_charge_request, -1, relaxed);
+ 
+ 	if (sweet_charge_mode == 1 && mv >= 4360) {
+ 		request = 2;
+@@ -418,6 +424,61 @@ SweetBattery::s9Charge(const struct s9_battery_regs *r)
+ 		sweet_charge_mode = err ? sweet_charge_mode : 2;
+ 		IOLog("SWEET BATTERY: charging off (%d): CNFG_00 0x%02x -> 0x%02x\n", err, r->cnfg00, off00[1]);
+ 	}
++	/*
++	 * While we charge with the charger's watchdog on, clear it every poll,
++	 * as Linux does on every health check (max77705_chg_set_wdtmr_kick):
++	 * expired, it stops the charging (CHG_DETAILS_01 0xB).
++	 */
++	if (sweet_charge_mode == 1 && (r->cnfg00 & S9_CNFG00_WDTEN)) {
++		uint8_t cnfg06 = 0;
++		if (sweet_max77705_read(S9_CHG, S9_CHG_CNFG_06, &cnfg06, 1) == 0) {
++			const uint8_t kick[2] = { S9_CHG_CNFG_06,
++				                  (uint8_t)((cnfg06 & ~0x03u) | S9_CNFG06_CHGPROT | S9_CNFG06_WDTCLR) };
++			(void)sweet_max77705_write(S9_CHG, kick, 2);
++		}
++	}
++}
++
++/*
++ * The adapter that powerd reads (AdapterDetails) for a measured S9 source:
++ * what the cable gives (5 V at the charger's input limit), gone unplugged.
++ */
++void
++SweetBattery::publishAdapter(bool external, unsigned inputMa)
++{
++	const OSSymbol *key = OSSymbol::withCString("AdapterDetails");
++	if (key == NULL) {
++		return;
++	}
++	if (!external) {
++		if (properties->getObject(key) != NULL) {
++			properties->removeObject(key);
++			removeProperty(key);
++			settingsChangedSinceUpdate = true;
++		}
++		key->release();
++		return;
++	}
++	OSDictionary *adapter = OSDictionary::withCapacity(5);
++	unsigned w = (inputMa * 5 + 500) / 1000;
++	OSNumber *watts = OSNumber::withNumber(w ? w : 1, 32);
++	OSNumber *current = OSNumber::withNumber(inputMa, 32);
++	OSNumber *voltage = OSNumber::withNumber(5000ULL, 32);
++	OSNumber *family = OSNumber::withNumber(0xe000400aULL, 32);
++	if (adapter && watts && current && voltage && family) {
++		adapter->setObject("Watts", watts);
++		adapter->setObject("Current", current);
++		adapter->setObject("Voltage", voltage);
++		adapter->setObject("FamilyCode", family);
++		adapter->setObject("IsWireless", kOSBooleanFalse);
++		setPSProperty(key, adapter);    /* equal contents: no change notification */
++	}
++	OSSafeReleaseNULL(family);
++	OSSafeReleaseNULL(voltage);
++	OSSafeReleaseNULL(current);
++	OSSafeReleaseNULL(watts);
++	OSSafeReleaseNULL(adapter);
++	key->release();
+ }
+ 
+ /* Galaxy S9: one MAX77705 reading; false if the gauge did not answer sanely. */
+@@ -427,7 +488,7 @@ SweetBattery::pollS9(void)
+ 	struct s9_battery_regs r = {};
+ 	if (!s9Read(&r)) {
+ 		if (++fS9Errors == 3 && sweet_charge_mode == 1) {
+-			sweet_charge_request = 2;       /* best effort: the next good poll turns it off */
++			os_atomic_store(&sweet_charge_request, 2, relaxed);    /* best effort: the next good poll turns it off */
+ 		}
+ 		return false;
+ 	}
+@@ -473,6 +534,7 @@ SweetBattery::pollS9(void)
+ 	/* A measured level may warn (low battery alert); critical (powerd's shutdown) stays off. */
+ 	setAtWarnLevel(!external && percent <= 10);
+ 	putBool("SweetBatteryTemperatureEstimated", true);
++	publishAdapter(external, input);
+ 	updateStatus();
+ 
+ 	snprintf(sweet_battery_state, sizeof(sweet_battery_state),
+@@ -582,6 +644,9 @@ SweetBattery::start(IOService *provider)
+ 		fTimer = IOTimerEventSource::timerEventSource(this, &SweetBattery::timerFired);
+ 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
+ 			fTimerAdded = true;
++			if (fLoop->getThread() != NULL) {
++				thread_set_thread_name(fLoop->getThread(), "sweet.battery");
++			}
+ 			fRunning = true;
+ 			fTimer->setTimeoutMS(fS9 ? S9_POLL_MS : 30000);
+ 		} else {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 6635ad6..4cba4d5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -54,6 +54,7 @@
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern "C" int sweet_bind_current_thread(int cpu);   /* osfmk/kern/sched_prim.c */
++extern "C" void thread_set_thread_name(thread_t th, const char *name);  /* osfmk/kern/thread.c */
+ 
+ /*
+  * Galaxy S9: the framebuffer's own threads (the present work loop: cache
+@@ -490,6 +491,9 @@ AppleCLCD::start(IOService *provider)
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	if (fWorkLoop->getThread() != NULL) {
++		thread_set_thread_name(fWorkLoop->getThread(), "sweet.fb.vsync");
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -512,6 +516,9 @@ AppleCLCD::start(IOService *provider)
+ 			fVsync60 = true;
+ 		} else {
+ 			fPresentSrc->enable();
++			if (fPresentLoop->getThread() != NULL) {
++				thread_set_thread_name(fPresentLoop->getThread(), "sweet.fb.present");
++			}
+ 		}
+ 	}
+ 	if (fVsync60) {
