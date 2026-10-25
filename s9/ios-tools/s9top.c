@@ -7,8 +7,11 @@
  * named on the command line, its threads sorted by CPU time used in that
  * interval, with their names and scheduling priority.
  *
- *   s9top [-i SECONDS] [-n COUNT] [-t THREADS] NAME [NAME...]
+ *   s9top [-i SECONDS] [-n COUNT] [-t THREADS] [-a] NAME [NAME...]
  *
+ * -a also lists the 8 processes of the whole phone that used the most CPU in
+ * the interval, with their context switches and system calls per second
+ * (an unexpected CPU hog shows there even if nobody named it).
  * NAME is a process name, a pid, or kernel_task for the kernel's threads.
  * Read only: host_processor_info and proc_pidinfo (root sees every process).
  * The iOS SDK has no libproc.h, so the few declarations needed are below,
@@ -23,6 +26,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#define PROC_PIDTASKINFO        4
 #define PROC_PIDTHREADID64INFO  15
 #define PROC_PIDLISTTHREADIDS   28
 #define MAXTHREADNAMESIZE       64
@@ -39,6 +43,15 @@ struct proc_threadinfo {
 	int32_t  pth_priority;
 	int32_t  pth_maxpriority;
 	char     pth_name[MAXTHREADNAMESIZE];
+};
+
+struct proc_taskinfo {
+	uint64_t pti_virtual_size, pti_resident_size;
+	uint64_t pti_total_user, pti_total_system;      /* mach time units */
+	uint64_t pti_threads_user, pti_threads_system;
+	int32_t  pti_policy, pti_faults, pti_pageins, pti_cow_faults;
+	int32_t  pti_messages_sent, pti_messages_received;
+	int32_t  pti_syscalls_mach, pti_syscalls_unix, pti_csw, pti_threadnum, pti_numrunning, pti_priority;
 };
 
 extern int proc_listallpids(void *buffer, int buffersize);
@@ -155,6 +168,81 @@ struct delta {
 	struct thr *t;
 };
 
+/* -a: every process's CPU time, context switches and system calls (previous sample). */
+#define MAX_ALL 4096
+struct proc_sample {
+	int pid;
+	uint64_t ticks, csw, sys;
+};
+static struct proc_sample all_prev[MAX_ALL], all_now[MAX_ALL];
+static int all_nprev;
+
+static int
+sample_all(struct proc_sample *out)
+{
+	static int pids[MAX_ALL];
+	int n = proc_listallpids(pids, sizeof(pids)), k = 0;
+	for (int i = 0; i < n && k < MAX_ALL; i++) {
+		struct proc_taskinfo ti;
+		if (pids[i] < 0 || proc_pidinfo(pids[i], PROC_PIDTASKINFO, 0, &ti, sizeof(ti)) != (int)sizeof(ti)) {
+			continue;
+		}
+		out[k].pid = pids[i];
+		out[k].ticks = ti.pti_total_user + ti.pti_total_system;
+		out[k].csw = (uint32_t)ti.pti_csw;
+		out[k].sys = (uint32_t)ti.pti_syscalls_mach + (uint32_t)ti.pti_syscalls_unix;
+		k++;
+	}
+	return k;
+}
+
+struct all_delta {
+	int pid;
+	double ns, csw, sys;
+};
+
+static int
+by_all_ns(const void *a, const void *b)
+{
+	const struct all_delta *x = a, *y = b;
+	return x->ns < y->ns ? 1 : (x->ns > y->ns ? -1 : 0);
+}
+
+static void
+print_all(double secs, const mach_timebase_info_data_t *tb)
+{
+	static struct all_delta d[MAX_ALL];
+	int n = sample_all(all_now), nd = 0;
+	for (int i = 0; i < n; i++) {
+		for (int j = 0; j < all_nprev; j++) {
+			if (all_prev[j].pid == all_now[i].pid) {
+				if (all_now[i].ticks >= all_prev[j].ticks) {
+					d[nd].pid = all_now[i].pid;
+					d[nd].ns = (double)(all_now[i].ticks - all_prev[j].ticks) * tb->numer / tb->denom;
+					d[nd].csw = (double)(uint32_t)(all_now[i].csw - all_prev[j].csw);
+					d[nd].sys = (double)(uint32_t)(all_now[i].sys - all_prev[j].sys);
+					nd++;
+				}
+				break;
+			}
+		}
+	}
+	qsort(d, (size_t)nd, sizeof(d[0]), by_all_ns);
+	printf("  top processes:\n");
+	for (int k = 0; k < nd && k < 8 && d[k].ns > 0; k++) {
+		char name[256] = "?";
+		if (d[k].pid == 0) {
+			strcpy(name, "kernel_task");
+		} else {
+			proc_name(d[k].pid, name, sizeof(name));
+		}
+		printf("    %5.1f%%  %-20s [%d]  csw/s %.0f  syscalls/s %.0f\n", 100.0 * d[k].ns / (secs * 1e9), name,
+		    d[k].pid, d[k].csw / secs, d[k].sys / secs);
+	}
+	memcpy(all_prev, all_now, (size_t)n * sizeof(all_now[0]));
+	all_nprev = n;
+}
+
 static int
 by_ns(const void *a, const void *b)
 {
@@ -166,14 +254,15 @@ int
 main(int argc, char **argv)
 {
 	double interval = 1.0;
-	int count = 10, show = 12, ch;
-	while ((ch = getopt(argc, argv, "i:n:t:")) != -1) {
+	int count = 10, show = 12, ch, all = 0;
+	while ((ch = getopt(argc, argv, "i:n:t:a")) != -1) {
 		switch (ch) {
 		case 'i': interval = atof(optarg); break;
 		case 'n': count = atoi(optarg); break;
 		case 't': show = atoi(optarg); break;
+		case 'a': all = 1; break;
 		default:
-			fprintf(stderr, "usage: s9top [-i SECONDS] [-n COUNT] [-t THREADS] NAME [NAME...]\n");
+			fprintf(stderr, "usage: s9top [-i SECONDS] [-n COUNT] [-t THREADS] [-a] NAME [NAME...]\n");
 			return 2;
 		}
 	}
@@ -196,6 +285,9 @@ main(int argc, char **argv)
 	int have_stats = cpu_stats(&nstat, &s0) == 0;
 	mach_timebase_info_data_t tb;
 	mach_timebase_info(&tb);
+	if (all) {
+		all_nprev = sample_all(all_prev);
+	}
 	uint64_t m0 = mach_absolute_time();
 
 	for (int round = 0; round < count; round++) {
@@ -239,6 +331,9 @@ main(int argc, char **argv)
 			vm_deallocate(mach_task_self(), (vm_address_t)s0, nstat * sizeof(*s0));
 			s0 = s1;
 			nstat = ns2;
+		}
+		if (all) {
+			print_all(secs, &tb);
 		}
 
 		for (int i = 0; i < nprocs; i++) {

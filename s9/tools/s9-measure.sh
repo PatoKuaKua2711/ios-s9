@@ -96,7 +96,7 @@ snap() {
 # (kern.sweet_cpu_freq, 0101+: a gold clock below the row set = LMh throttling) sampled beside it.
 bench() {
 	snap "$1-before"
-	ssh9 "$B/s9top -i 1 -n $((${2:-4} * 4 + 2)) -t 10 backboardd Preferences SpringBoard kernel_task" > "$out/top-$1.txt" 2>&1 &
+	ssh9 "$B/s9top -a -i 1 -n $((${2:-4} * 4 + 2)) -t 10 backboardd Preferences SpringBoard kernel_task" > "$out/top-$1.txt" 2>&1 &
 	tp=$!
 	ssh9 "i=0; while [ \$i -lt $((${2:-4} * 8 + 4)) ]; do echo \$(date +%s) \$(sysctl -n kern.sweet_cpu_freq 2>/dev/null); sleep 0.5; i=\$((i + 1)); done" > "$out/freq-$1.txt" 2>&1 &
 	fq=$!
@@ -132,7 +132,7 @@ cat "$out/membw.txt"
 echo "== 3. idle in Settings"
 prep
 snap idle-before
-ssh9 "$B/s9top -i 2 -n 10 -t 8 backboardd SpringBoard Preferences kernel_task" > "$out/top-idle.txt" 2>&1
+ssh9 "$B/s9top -a -i 2 -n 10 -t 8 backboardd SpringBoard Preferences kernel_task" > "$out/top-idle.txt" 2>&1
 snap idle-after
 
 echo "== 4. scrolling, defaults"

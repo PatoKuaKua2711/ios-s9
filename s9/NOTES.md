@@ -260,10 +260,11 @@ Ferramentas novas: `tools/s9-ui.sh` (unlock/tap/swipe/open via dedo virtual), `t
 **Gravado no aparelho (inalterado nesta sessão):** `out/boot-ios14.img` (kernel 0098). O celular ficou desligado
 no TWRP. Nada foi enviado ao aparelho (sem adb/SSH/flash).
 
-**Pronto para gravar:** `out/boot-ios16.img` = kernel **0100** (`../work/s9-kernel-18`, CI xnu 40172653789,
-sha256 `c25c52cc5f966d27b7b5878d350567d193b5109f7a9b198e87aa3517f6a1090c`), mesmos boot-args do ios14 (receita: `mkpayload.py KERNEL out/s9-xr2.adt OUT --cmdline
+**Pronto para gravar:** `out/boot-ios17.img` = kernel **0101** (`../work/s9-kernel-19`, CI xnu 40173879069,
+sha256 `ab8c34825e34b9d023302e1cd1df8e600949db0c07cda5ac97b476f70c6431c6`), mesmos boot-args do ios14 (receita: `mkpayload.py KERNEL out/s9-xr2.adt OUT --cmdline
 "<cmdline do ios14>"` + `PAYLOAD=... ./build.sh m4`; conferido: reproduz o payload-ios14 byte a byte).
-`out/boot-ios15.img` = 0099 sozinho (sha `210b081c...`), só se o 0100 der problema.
+Degraus de volta: `boot-ios16.img` = 0100 (sha `c25c52cc...`), `boot-ios15.img` = 0099 (sha `210b081c...`),
+`boot-ios14.img` = 0098 (o gravado hoje).
 
 **Estudo completo:** `ESTUDO-2026-10-24.md` (renderizador do CA, bateria, áudio, bugs, plano). Resumo:
 - **0099** (CI 40154808570): bateria real do MAX77705 (fuel gauge 0x36 + carregador 0x69, barramento bit-bang
@@ -272,6 +273,8 @@ sha256 `c25c52cc5f966d27b7b5878d350567d193b5109f7a9b198e87aa3517f6a1090c`), mesm
   IOSurface por tabela de id, estatística de retângulo sujo na linha de fps, `aks_lock_device` aceito, teclas na CPU 0.
 - **0100** (CI 40172653789): watchdog do carregador "chutado" enquanto nós carregamos, `AdapterDetails` do cabo
   medido, pedido da sysctl atômico, threads do port com nome (`sweet.usb`, `sweet.touch`, `sweet.fb.present`...).
+- **0101** (CI 40173879069): `kern.sweet_cpu_freq` = clock atual de L3/silver/gold lido do `PSTATE_STATUS` do OSM
+  (depois dos limites do LMh), ao lado da linha pedida: mostra se o gold é estrangulado durante a rolagem.
 - Achado: o Linux do TWRP **desliga o carregador** ao desligar (`CNFG_00=0x04`, `CNFG_09=0x0F`); o 0099 registra no
   boot se continua assim.
 - 60 fps: a conta do trabalho de pixels dá 5-15 ms/quadro contra ~40 ms medidos: falta medir onde está o resto.
@@ -288,7 +291,7 @@ do kernel ao powerd, `-w` observa notificações), tweak `S9CAEnv` (backboardd; 
 `s9play` (tom + rota atual) em `jb/audio/` (CI 40173419881); `tools/s9-audio.sh install|test|remove`,
 `tools/s9-audio-recv.py` (grava/toca no PC). Testado só no PC (stubs): falta ver se o VirtualAudio o escolhe.
 
-**Próxima sessão (ordem):** `tools/flash-twrp.sh out/boot-ios16.img` → conferir `SWEET BATTERY:` no log ao vivo →
+**Próxima sessão (ordem):** `tools/flash-twrp.sh out/boot-ios17.img` → conferir `SWEET BATTERY:` no log ao vivo →
 `tools/s9-measure.sh` → decidir pela tabela da seção 5 do ESTUDO → (opcional) `tools/s9-audio.sh install` + `test`.
 
 ## Handoff (2026-10-24, noite): o que está gravado e funcionando
