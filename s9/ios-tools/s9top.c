@@ -7,6 +7,7 @@
  *
  *   s9top [-i SECONDS] [-n COUNT] [-t THREADS] NAME [NAME...]
  *
+ * NAME is a process name, a pid, or kernel_task for the kernel's threads.
  * Read only: host_processor_info and proc_pidinfo (root sees every process).
  * The iOS SDK has no libproc.h, so the few declarations needed are below,
  * matching bsd/sys/proc_info.h of xnu-8796.
@@ -58,11 +59,18 @@ struct proc {
 	struct thr t[MAX_THREADS];
 };
 
+/* A process name, a pid in digits, or kernel_task (pid 0: the kernel's own threads). */
 static int
 find_pid(const char *want)
 {
 	static int pids[4096];
-	int n = proc_listallpids(pids, sizeof(pids)) ;
+	if (strcmp(want, "kernel_task") == 0) {
+		return 0;
+	}
+	if (want[0] >= '0' && want[0] <= '9') {
+		return atoi(want);
+	}
+	int n = proc_listallpids(pids, sizeof(pids));
 	for (int i = 0; i < n; i++) {
 		char name[256] = "";
 		if (pids[i] > 0 && proc_name(pids[i], name, sizeof(name)) > 0 && strcmp(name, want) == 0) {
@@ -77,9 +85,9 @@ sample_threads(struct proc *p)
 {
 	static uint64_t ids[MAX_THREADS];
 	p->n = 0;
-	if (p->pid <= 0) {
+	if (p->pid < 0) {
 		p->pid = find_pid(p->want);
-		if (p->pid <= 0) {
+		if (p->pid < 0) {
 			return;
 		}
 	}
@@ -146,7 +154,7 @@ main(int argc, char **argv)
 	static struct proc before[MAX_PROCS], after[MAX_PROCS];
 	for (int i = 0; i < nprocs; i++) {
 		before[i].want = after[i].want = argv[optind + i];
-		before[i].pid = after[i].pid = 0;
+		before[i].pid = after[i].pid = -1;
 		sample_threads(&before[i]);
 		after[i].pid = before[i].pid;
 	}
