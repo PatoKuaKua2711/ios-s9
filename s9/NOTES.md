@@ -255,6 +255,42 @@ dono**: ele não quer mais overclock), threads de present e vsync presas na CPU 
 Ferramentas novas: `tools/s9-ui.sh` (unlock/tap/swipe/open via dedo virtual), `tools/s9-bench.sh`,
 `tools/s9-tune.sh` (prep/bench/capref/membw), `tools/s9-profile.sh` (spindump + simbolização do backboardd).
 
+## Handoff (2026-10-25): sessão de estudo SEM aparelho → próxima sessão = uma ida ao TWRP
+
+**Gravado no aparelho (inalterado nesta sessão):** `out/boot-ios14.img` (kernel 0098). O celular ficou desligado
+no TWRP. Nada foi enviado ao aparelho (sem adb/SSH/flash).
+
+**Pronto para gravar:** `out/boot-ios16.img` = kernel **0100** (`../work/s9-kernel-18`, CI xnu 40172653789,
+sha256 `c25c52cc5f966d27b7b5878d350567d193b5109f7a9b198e87aa3517f6a1090c`), mesmos boot-args do ios14 (receita: `mkpayload.py KERNEL out/s9-xr2.adt OUT --cmdline
+"<cmdline do ios14>"` + `PAYLOAD=... ./build.sh m4`; conferido: reproduz o payload-ios14 byte a byte).
+`out/boot-ios15.img` = 0099 sozinho (sha `210b081c...`), só se o 0100 der problema.
+
+**Estudo completo:** `ESTUDO-2026-10-24.md` (renderizador do CA, bateria, áudio, bugs, plano). Resumo:
+- **0099** (CI 40154808570): bateria real do MAX77705 (fuel gauge 0x36 + carregador 0x69, barramento bit-bang
+  compartilhado `bsd/dev/sweet_max77705.c`; `kern.sweet_battery` = leitura; carga só com `kern.sweet_charge=1`,
+  checada, desliga em 4,36 V), `cpu_idle` sem esvaziar o L1 antes do WFI (`kern.sweet_idle_flush`), lock/unlock de
+  IOSurface por tabela de id, estatística de retângulo sujo na linha de fps, `aks_lock_device` aceito, teclas na CPU 0.
+- **0100** (CI 40172653789): watchdog do carregador "chutado" enquanto nós carregamos, `AdapterDetails` do cabo
+  medido, pedido da sysctl atômico, threads do port com nome (`sweet.usb`, `sweet.touch`, `sweet.fb.present`...).
+- Achado: o Linux do TWRP **desliga o carregador** ao desligar (`CNFG_00=0x04`, `CNFG_09=0x0F`); o 0099 registra no
+  boot se continua assim.
+- 60 fps: a conta do trabalho de pixels dá 5-15 ms/quadro contra ~40 ms medidos: falta medir onde está o resto.
+  `CA_FORCE_TIMER=1` **liga** o VBL do CA (desmontagem); hoje ele usa relógio próprio.
+- Áudio: tudo passa pelo ADSP (firmware `adsp.mdt` na partição modem); caminho curto = plug-in AudioServerPlugIn
+  (o HAL do iOS carrega `/System/Library/Audio/Plug-Ins/HAL/*.driver`) mandando o som ao PC.
+
+**Ferramentas novas** (fork, CI s9-ios-tools; cópias em `jb/measure/` com SHA256SUMS): `s9top` (CPU por núcleo e por
+thread, IRQ/IPI/timer por núcleo, aceita `kernel_task`), `s9membw` (banda e latência de memória), `s9batt` (bateria
+do kernel ao powerd, `-w` observa notificações), tweak `S9CAEnv` (backboardd; põe `CA_*` de
+`/var/mobile/Library/S9CAEnv/env.txt` no ambiente; sem o arquivo não faz nada; sem hooks).
+`tools/s9-measure.sh`: a ida inteira de medição, sem ninguém no aparelho (~10 min).
+Áudio, caminho A: `S9Audio.driver` (AudioServerPlugIn, saída USB 48 kHz que manda o som ao PC por UDP 5141) +
+`s9play` (tom + rota atual) em `jb/audio/` (CI 40173419881); `tools/s9-audio.sh install|test|remove`,
+`tools/s9-audio-recv.py` (grava/toca no PC). Testado só no PC (stubs): falta ver se o VirtualAudio o escolhe.
+
+**Próxima sessão (ordem):** `tools/flash-twrp.sh out/boot-ios16.img` → conferir `SWEET BATTERY:` no log ao vivo →
+`tools/s9-measure.sh` → decidir pela tabela da seção 5 do ESTUDO → (opcional) `tools/s9-audio.sh install` + `test`.
+
 ## Handoff (2026-10-24, noite): o que está gravado e funcionando
 
 **Boot atual:** `out/boot-ios11.img` = kernel 0095 (`../work/s9-kernel-13`, CI xnu run 40116531969) + ADT
