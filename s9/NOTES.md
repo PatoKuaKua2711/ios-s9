@@ -286,7 +286,11 @@ Degraus de volta: `boot-ios16.img` = 0100 (sha `c25c52cc...`), `boot-ios15.img` 
 thread, IRQ/IPI/timer por núcleo, aceita `kernel_task`), `s9membw` (banda e latência de memória), `s9batt` (bateria
 do kernel ao powerd, `-w` observa notificações), tweak `S9CAEnv` (backboardd; põe `CA_*` de
 `/var/mobile/Library/S9CAEnv/env.txt` no ambiente; sem o arquivo não faz nada; sem hooks).
-`tools/s9-measure.sh`: a ida inteira de medição, sem ninguém no aparelho (~10 min).
+`tools/s9-measure.sh`: a ida inteira de medição, sem ninguém no aparelho (~10 min); no fim escreve `report.md`
+(`tools/s9-measure-report.py`). Ensaiado de ponta a ponta contra um "celular de mentira":
+`tools/s9-dryrun.sh SANDBOX SCRIPT [ARGS]` (s9ssh.sh falso, caminhos do iOS remapeados, sysctl/ps/killall/spindump
+falsos, stand-ins das ferramentas, esperas 10x menores): todas as etapas rodam, os arquivos instalados batem
+byte a byte com `jb/measure`, o `env.txt` é removido no fim; o áudio grava um tom de 440 Hz sem perdas.
 Áudio, caminho A: `S9Audio.driver` (AudioServerPlugIn, saída USB 48 kHz que manda o som ao PC por UDP 5141) +
 `s9play` (tom + rota atual) em `jb/audio/` (CI 40173419881); `tools/s9-audio.sh install|test|remove`,
 `tools/s9-audio-recv.py` (grava/toca no PC). Testado só no PC (stubs): falta ver se o VirtualAudio o escolhe.
