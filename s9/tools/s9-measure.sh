@@ -114,6 +114,14 @@ esac
 out=${1:-logs/measure-$(date +%Y%m%d-%H%M)}
 mkdir -p "$out"
 ssh9 true || { echo "no SSH to the phone (USB network up?)" >&2; exit 1; }
+# Right after a boot the respring job (jb-launchd.py) restarts SpringBoard once
+# so the tweaks load: start only when it is done, or the unlock is lost.
+i=0
+while ssh9 'ps -axo command= | grep -q "[i]os-s9-respring"' && [ $i -lt 180 ]; do
+	[ $i -eq 0 ] && echo "waiting for the boot's respring to finish..."
+	sleep 5
+	i=$((i + 5))
+done
 python3 -I tools/s9-log.py "$out/kernel.txt" &
 logp=$!
 trap 'kill $logp 2>/dev/null' EXIT
