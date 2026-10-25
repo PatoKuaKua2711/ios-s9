@@ -255,6 +255,36 @@ dono**: ele não quer mais overclock), threads de present e vsync presas na CPU 
 Ferramentas novas: `tools/s9-ui.sh` (unlock/tap/swipe/open via dedo virtual), `tools/s9-bench.sh`,
 `tools/s9-tune.sh` (prep/bench/capref/membw), `tools/s9-profile.sh` (spindump + simbolização do backboardd).
 
+## Primeiro boot do 0101 (2026-10-25, manhã, dono acordado)
+
+`out/boot-ios17.img` gravado com `tools/flash-twrp.sh` (leitura de volta ok, sha `ab8c3482...`). **SSH em 37 s**,
+SpringBoard/backboardd/mediaserverd de pé. Medido:
+- `kern.sweet_battery` (MAX77705 de verdade): `soc=97.4% vcell=4263mV avg=-215mA now=-103mA rep=2959/3036mAh
+  design=2845mAh cycles=1.17 chgin=1 dtls=0x1 bat=3 cnfg00=0x15 cnfg09=0x13(in 500mA en 0) cc=500mA`. O fuel gauge
+  responde (status 0x0080).
+- **Achado:** vindo do TWRP, o carregador estava LIGADO com o **watchdog ligado** (`cnfg00=0x15` = carga + buck +
+  WDTEN; o driver Linux do TWRP o liga e o renova). No iOS ninguém renova: ~1 min depois `dtls=0xb` (watchdog
+  expirado), `now=2mA`, a carga para. Com tela/CPU ligados a bateria cai mesmo no cabo (limite de entrada 500 mA).
+  Correção: `kern.sweet_charge=1` (0100 renova o watchdog a cada leitura). Dono escolheu ligar depois da medição.
+  Para um próximo kernel: decidir se, achando o carregador já carregando com WDTEN, o kernel mantém a carga
+  (renova) sem precisar da sysctl.
+- `kern.sweet_cpu_freq`: `l3 1478 MHz (row 13), silver 1689 MHz (row 16), gold 2649 MHz (row 22)` em repouso.
+- **Raio de carregando aparece** (dono confirmou: "reconhecendo o fakecharge, esteticamente bonito"). Desempenho
+  percebido igual (esperado: o 0099 só tirou desperdícios pequenos).
+- **Medição** `tools/s9-measure.sh logs/measure-20261025-ios17` (interrompida na etapa 6/9: o dono foi ao TWRP;
+  `report.md` na pasta). Rolagem dos Ajustes, fps mediana/máx e IPI/s: padrão 23/28 e 30.016; **`kern.sweet_parallelism=2`
+  31/53 e 12.151**; =1 23/25; =4 22/28; `kern.sweet_idle_flush=1` 24/29 (nada). backboardd ~228 % de CPU, 35.946
+  trocas de contexto/s, 52.173 syscalls/s, A75 só ~152 % de 400: o gargalo é acordar ajudantes do `dispatch_apply`
+  (IPIs), não CPU. Memória: escrita 19,9 / cópia 13,4 / leitura 7,4 GB/s com 1 thread (até 18,6 de cópia com 4),
+  latência 250 ns. Gold fixo em 2649 MHz (sem LMh). Parado: ~2 % de CPU. Faltaram spindump, `CA_PRINT_PERF`,
+  `CA_FORCE_TIMER=1`, `CA_PRINT_ANIMATIONS`. Relatório: `s9-measure-report.py` agrupa threads sem nome como "-" e
+  conta as idle do kernel: corrigir antes da próxima ida.
+- **Ganho rápido para o próximo kernel:** `sweet_parallelism` padrão 2 (hoje 0; só sysctl, sem boot-arg).
+- Estado deixado: tweak S9CAEnv e ferramentas instalados (inertes sem `env.txt`, que não foi escrito); o celular
+  voltou ao TWRP com `boot-ios17` na partição boot.
+- **Próxima sessão: aceleração gráfica** com base no Bergamota (iOS 18 no Poco F1, mesmo SDM845/Adreno 630) e no
+  Chlorophyll (Metal sobre Mesa freedreno): prompt em `PROMPT-sessao-2026-10-25-gpu.md`.
+
 ## Handoff (2026-10-25): sessão de estudo SEM aparelho → próxima sessão = uma ida ao TWRP
 
 **Gravado no aparelho (inalterado nesta sessão):** `out/boot-ios14.img` (kernel 0098). O celular ficou desligado
