@@ -19,3 +19,5 @@ s9/logs/
 # third-party jailbreak downloads (fetch-jailbreak.sh) and your SSH key
 s9/jailbreak/jb/
 s9/tools/frida/node_modules/
+shim/fw_a630_gmu.h
+s9/shim/fw_a630_gmu.h

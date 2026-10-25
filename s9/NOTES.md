@@ -255,6 +255,45 @@ dono**: ele não quer mais overclock), threads de present e vsync presas na CPU 
 Ferramentas novas: `tools/s9-ui.sh` (unlock/tap/swipe/open via dedo virtual), `tools/s9-bench.sh`,
 `tools/s9-tune.sh` (prep/bench/capref/membw), `tools/s9-profile.sh` (spindump + simbolização do backboardd).
 
+## Aceleração gráfica da Adreno 630 — estudo + shim M10 (2026-10-25, tarde, sem aparelho)
+
+Objetivo da sessão (prompt `PROMPT-sessao-2026-10-25-gpu.md`): estudar Bergamota + Chlorophyll e começar a ligar a
+GPU. Estudo completo em **`ESTUDO-2026-10-25-gpu.md`**. Referências baixadas em `ref/` (commits anotados no estudo):
+Bergamota (iOS 18 no Poco F1, mesmo SDM845/A630; sem licença, só fatos), Chlorophyll (driver Metal, MIT),
+**HackiOS** (`oosexgang/hackios-xnu-kernel` APSL + `-userland` MIT: iOS **16.5** rodando a UI inteira na Adreno 642L
+por Mesa/freedreno — o caso mais perto do nosso).
+
+**Dois achados que reduzem muito o risco:**
+1. **Zap da Samsung extraído** do `BL/NON-HLOS.bin` oficial (`image/a630_zap.mdt`+`.b00/.b01/.b02`, ELF32, 1 segmento
+   de código relocável) → `research/gpu-fw/` (fora do git). O zap assinado por aparelho era o maior desconhecido dos
+   dois projetos (o Bergamota não tinha o do beryllium); temos o do próprio S9.
+2. **No iOS 16 o CoreAnimation usa o OpenGL ES nativamente**: na nossa desmontagem (QuartzCore 20H392),
+   `EAGLServer::renderer()` sem Metal cai em `[EAGLContext initWithAPI:3]` + `CA::OGL::GLESContext`, e
+   `enable_ogl` (de `CA_ENABLE_OGL`) é **ligado por padrão**. Basta o backboardd ter um `EAGLContext` nosso (Mesa por
+   trás) — sem o gancho de vtable que o Bergamota precisou no iOS 18. O HackiOS prova a UI inteira na GPU no iOS 16.5.
+
+**Hardware do S9 conferido no DT ao vivo:** GPU 0x5000000 (chipid 0x06030001 = A630 v2), GMU 0x506a000, gpucc
+0x5090000, GCC 0x100000, PDC 0xb200000, SMMU da GPU 0x5040000 (nossa, não emulada pelo hyp), zap PAS 13 região
+0x8c415000. Registradores e sequência do kernel Android do próprio S9 (LineageOS 20 `drivers/gpu/msm`).
+
+**Plano por etapas** (crítico = ligar a GPU; GLES/Metal é software que os dois projetos já rodam no mesmo chip):
+A GMU (energia+relógios+firmware → `0xBABEFACE`) · B SMMU+GX+HFI · C zap+CP (NOP) — **tudo no shim** (hardware
+arriscado primeiro, 10 s, watchdog); depois D driver no XNU (ioctls msm como o HackiOS), E OpenGL ES (Mesa freedreno
++ EAGL nosso no backboardd), F medir e Metal. Tabela completa no estudo, seção 5.
+
+**Feito: etapa A = shim M10** (`shim/m10.c` ~460 linhas, `build.sh m10`; compila sem avisos, 0 relocações absolutas):
+- etapa 1 leitura de GCC/gpucc; 2 liga o CX GDSC + relógios do GMU a 200 MHz (RCG cfg 0x602) + escreve/lê a memória
+  do GMU com o CM3 em reset; 3 micro-código RSC/PDC + firmware do GMU no ITCM + solta o CM3 → espera `0xBABEFACE`.
+- Firmware: `a630_gmu.bin` (32768 B, sha `da8d9b1b…`) e `a630_sqe.fw` (34188 B, sha `1c21b527…`) do linux-firmware em
+  `research/gpu-fw/`; `tools/gpu-fw-embed.py` gera `shim/fw_a630_gmu.h` (git-ignored). **Nada de firmware no git.**
+- Imagem pronta: **`out/boot-m10.img`** (sha `f66a548e…`, firmware embutido). Não gravada: o aparelho não estava no
+  USB nesta sessão (nem adb nem lsusb o viam).
+
+**Próxima ida (uma gravação, uma foto):** `tools/flash-twrp.sh out/boot-m10.img` (substitui o `boot-ios17` na boot) →
+foto da tela (esperado "O FIRMWARE DO GMU RODA / 0xBABEFACE") → `tools/flash-twrp.sh out/boot-ios17.img` volta ao iOS.
+Se a foto mostrar a fundação de pé, escrevo a M11 (SMMU + GX). O shim M10 não depende de nada gravado hoje
+(`boot-ios17`=0101 segue na boot; a gravação do M10 é opcional e reversível).
+
 ## Primeiro boot do 0101 (2026-10-25, manhã, dono acordado)
 
 `out/boot-ios17.img` gravado com `tools/flash-twrp.sh` (leitura de volta ok, sha `ab8c3482...`). **SSH em 37 s**,
