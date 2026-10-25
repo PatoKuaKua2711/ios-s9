@@ -11,6 +11,7 @@
 #   5. kern.sweet_idle_flush A/B/A (0, 1, 0)                     ~1.5 min
 #   6. spindump of the scrolling (s9-profile.sh)                 ~1 min
 #   7. CoreAnimation's own counters (CA_PRINT_PERF)              ~1.5 min, restarts backboardd
+#   7b. CoreAnimation paced by the kernel's vsync (CA_FORCE_TIMER=1, which sets use_vbl)  ~1.5 min
 #   8. who animates while idle (CA_PRINT_ANIMATIONS)             ~1 min, restarts backboardd
 #   9. back to normal (env.txt removed, restart), battery again
 # Never touches charging, CPU/L3/DDR clocks, the bandwidth vote or the boot
@@ -144,6 +145,12 @@ if caenv CA_PRINT_PERF=1 X_LOG_FILE=$CAD/ca-perf.log; then
 	bench caperf 4
 	sleep 10
 	ssh9 "cat $CAD/ca-perf.log" > "$out/ca-perf.log" 2>&1
+fi
+
+echo "== 7b. frames paced by the kernel's vsync (CA_FORCE_TIMER=1 = use_vbl, sel 72 notifications)"
+if caenv CA_FORCE_TIMER=1 CA_PRINT_PERF=1 X_LOG_FILE=$CAD/ca-vbl.log; then
+	bench vbl 4
+	ssh9 "cat $CAD/ca-vbl.log" > "$out/ca-vbl.log" 2>&1
 fi
 
 echo "== 8. animations while idle (CA_PRINT_ANIMATIONS)"

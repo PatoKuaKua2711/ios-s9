@@ -44,7 +44,17 @@ jobs:
           for t in s9top s9membw s9batt; do
             codesign -f -s - "out/$t"
           done
-          shasum -a 256 out/* > out/SHA256SUMS
+          # S9Audio HAL driver (audio path A: iOS's sound to the PC over the USB network) and s9play
+          mkdir -p out/S9Audio.driver
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -Wall -Werror -bundle \
+            -framework CoreFoundation -o out/S9Audio.driver/S9Audio S9Audio.c
+          cp S9Audio-Info.plist out/S9Audio.driver/Info.plist
+          codesign -f -s - out/S9Audio.driver
+          codesign -dv out/S9Audio.driver
+          xcrun -sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 -Os -Wall -Werror -fobjc-arc \
+            -framework Foundation -framework AVFoundation -framework AudioToolbox s9play.m -o out/s9play
+          codesign -f -s - out/s9play
+          find out -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 shasum -a 256 > out/SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
           name: s9-ios-tools
