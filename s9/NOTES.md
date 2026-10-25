@@ -289,10 +289,23 @@ arriscado primeiro, 10 s, watchdog); depois D driver no XNU (ioctls msm como o H
 - Imagem pronta: **`out/boot-m10.img`** (sha `f66a548e…`, firmware embutido). Não gravada: o aparelho não estava no
   USB nesta sessão (nem adb nem lsusb o viam).
 
-**Próxima ida (uma gravação, uma foto):** `tools/flash-twrp.sh out/boot-m10.img` (substitui o `boot-ios17` na boot) →
-foto da tela (esperado "O FIRMWARE DO GMU RODA / 0xBABEFACE") → `tools/flash-twrp.sh out/boot-ios17.img` volta ao iOS.
-Se a foto mostrar a fundação de pé, escrevo a M11 (SMMU + GX). O shim M10 não depende de nada gravado hoje
-(`boot-ios17`=0101 segue na boot; a gravação do M10 é opcional e reversível).
+**🎉 M10 GRAVADO E PASSOU DE PRIMEIRA (2026-10-25, tarde, foto do dono):** todas as etapas verdes.
+- Etapa 1: gpucc já acessível (ABL deixou o AHB da GPU ligado); CX/GX GDSCR 0x00222001 (SW_COLLAPSE setado).
+- Etapa 2: cfg_ahb on; **CX GDSC ligou (GDSCR 0xF8222000, PWR_ON)**; GMU RCG cfg 0x602 (200 MHz); cxo/gpu_ahb/ddrss/snoc
+  cbcr 0x1, cx_gmu/memnoc cbcr 0x4221 (rodando, bit31 limpo); RPMH_POWER_STATE 0xF; **DTCM escreve/lê** 600D0001/0A110002.
+- Etapa 3: firmware 0x2000 palavras, **0 erradas**; **`fw_init_result = 0xBABEFACE` → "O FIRMWARE DO GMU RODA"**.
+Mesmo marco do Bergamota 0117g3 / HackiOS passo 15, aqui de primeira. Para voltar ao iOS, `tools/flash-twrp.sh out/boot-ios17.img` (0101).
+
+**Etapa B = shim M11** (`shim/m11.c`, `build.sh m11`, `out/boot-m11.img` sha `d7163d4c…`): refaz a sequência do M10 e
+adiciona a SMMU da GPU (0x5040000) + HFI. Ordem: 1 energia; 2 **sonda a SMMU só-leitura** (IDR0/1, SCR0, SMR/S2CR/CB0
+como o hyp deixou — o único desconhecido do S9 é se o RKP da Samsung deixa programar a SMMU da GPU); 3 **programa a
+SMMU** (tabelas 3-níveis 4K em buffers estáticos, PA=VA com MMU off; mapeia GMU-VA 0x60000000→HFI 16K e
+0x60100000→dump 16K; CB0, SID 4/5→CB0; lê cada escrita de volta); 4 firmware + boot **com `HFI_QTBL_ADDR=0x60000000`**
+(tem de ser antes de soltar o CM3) → 0xBABEFACE; 5 `HFI_CTRL_INIT` + manda `H2F_MSG_INIT` e `H2F_MSG_FW_VER` (polling
+do GMU2HOST_INTR, sem IRQ) → versão do firmware. GX/CP ficam para a etapa C (M12), isoladas porque ligar a GX é o
+passo que pode reiniciar o SoC. SMMU seguindo arm-smmu.c (smmu-v2); HFI seguindo kgsl_hfi.c; send/receive por polling
+como o HackiOS. **GRAVADO 2026-10-25 tarde; aguardando a foto** (perguntas: o hyp deixa a SMMU? o GMU responde HFI?).
+Depois: etapa C (zap da Samsung já extraído + CP).
 
 ## Primeiro boot do 0101 (2026-10-25, manhã, dono acordado)
 
