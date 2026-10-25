@@ -1,0 +1,88 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index 82b1454..793196f 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,6 +17,8 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <sys/sysctl.h>
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -140,13 +142,50 @@ SweetCPU::start(IOService *provider)
+ 
+ extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
++/* The three OSM blocks (L3, silver, gold), mapped once at boot. */
++static const uint64_t sweet_osm_pa[3] = { 0x17d41000ULL, 0x17d43000ULL, 0x17d45800ULL };
++static volatile uint32_t *sweet_osm_va[3];
++
++/*
++ * sysctl kern.sweet_cpu_freq: each cluster's clock now, from the OSM's
++ * PSTATE_STATUS (CURRENT_LVAL, bits 23:16, x 19.2 MHz, as Linux's
++ * clk-cpu-osm reads it), next to the row we asked for. The OSM applies the
++ * hardware limits (LMh: temperature, current) itself, so a gold clock below
++ * what we set while scrolling means throttling. Reads only.
++ */
++static int
++sysctl_sweet_cpu_freq SYSCTL_HANDLER_ARGS
++{
++	(void)oidp;
++	(void)arg1;
++	(void)arg2;
++	static const char *const names[3] = { "l3", "silver", "gold" };
++	char buf[160];
++	int len = 0;
++	for (int i = 0; i < 3 && len < (int)sizeof(buf); i++) {
++		volatile uint32_t *osm = sweet_osm_va[i];
++		uint32_t st = osm != NULL ? osm[SWEET_OSM_PSTATE / 4] : 0;
++		uint32_t want = osm != NULL ? osm[SWEET_OSM_DESIRED(0) / 4] : 0;
++		uint32_t lval = (st >> 16) & 0xff;
++		len += snprintf(buf + len, sizeof(buf) - (size_t)len, "%s%s %u MHz (row %u)", i ? ", " : "",
++		    names[i], lval * 192 / 10, want);
++	}
++	return SYSCTL_OUT(req, buf, strlen(buf) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cpu_freq, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sweet_cpu_freq, "A", "S9: current L3, silver and gold clocks from the OSM (after hardware limits)");
++
+ static void
+-sweet_osm_set(const char *name, uint64_t phys, uint32_t max_mhz, bool per_core_ok)
++sweet_osm_set(const char *name, volatile uint32_t *osm, uint32_t max_mhz, bool per_core_ok)
+ {
+-	volatile uint32_t *osm = (volatile uint32_t *)ml_io_map(phys, 0x1000);
+ 	uint32_t prev_khz = 0, prev_cc = 0, best_khz = 0;
+ 	int best = -1;
+ 
++	if (osm == NULL) {
++		IOLog("SWEET CPU: %s OSM not mapped, left as is\n", name);
++		return;
++	}
++
+ 	for (int i = 0; i < SWEET_OSM_ROWS; i++) {
+ 		uint32_t v = osm[SWEET_OSM_FREQ(i) / 4];
+ 		uint32_t khz = (v >> 30) ? 19200 * (v & 0xff) : 300000;
+@@ -178,15 +217,18 @@ static void
+ sweet_cpu_clocks(void)
+ {
+ 	uint32_t on = 1, gold_mhz = 2649;
++	for (int i = 0; i < 3; i++) {
++		sweet_osm_va[i] = (volatile uint32_t *)ml_io_map(sweet_osm_pa[i], 0x1000);
++	}
+ 	PE_parse_boot_argn("sweetcpu", &on, sizeof(on));
+ 	PE_parse_boot_argn("sweetcpu_mhz", &gold_mhz, sizeof(gold_mhz));
+ 	if (!on) {
+ 		IOLog("SWEET CPU: clocks left as ABL set them (sweetcpu=0)\n");
+ 		return;
+ 	}
+-	sweet_osm_set("L3", 0x17d41000ULL, 1478, false);
+-	sweet_osm_set("silver", 0x17d43000ULL, 1689, true);
+-	sweet_osm_set("gold", 0x17d45800ULL, gold_mhz, true);
++	sweet_osm_set("L3", sweet_osm_va[0], 1478, false);
++	sweet_osm_set("silver", sweet_osm_va[1], 1689, true);
++	sweet_osm_set("gold", sweet_osm_va[2], gold_mhz, true);
+ }
+ 
+ /* Do not wait in a nub's start(): matching can be asynchronous or serialized. */

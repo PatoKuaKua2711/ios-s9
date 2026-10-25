@@ -88,16 +88,20 @@ caenv() {
 snap() {
 	ssh9 'sysctl kern.sweetfb_swaps kern.sweetfb_flips kern.sweetfb_copies kern.sweetfb_underruns
 		kern.sweet_surface_locks kern.sweet_surface_creates kern.sweet_surface_create_bytes
-		kern.sweet_idle_flush kern.sweet_parallelism kern.sweetfast kern.sweet_mem_vote kern.sweet_battery' > "$out/snap-$1.txt" 2>&1
+		kern.sweet_idle_flush kern.sweet_parallelism kern.sweetfast kern.sweet_mem_vote kern.sweet_battery
+		kern.sweet_cpu_freq' > "$out/snap-$1.txt" 2>&1
 }
 
-# bench NAME [N]: N synthetic flings in Settings with s9top running beside it.
+# bench NAME [N]: N synthetic flings in Settings with s9top and the clocks
+# (kern.sweet_cpu_freq, 0101+: a gold clock below the row set = LMh throttling) sampled beside it.
 bench() {
 	snap "$1-before"
-	ssh9 "$B/s9top -i 1 -n $((${2:-4} * 4 + 2)) -t 10 backboardd Preferences SpringBoard" > "$out/top-$1.txt" 2>&1 &
+	ssh9 "$B/s9top -i 1 -n $((${2:-4} * 4 + 2)) -t 10 backboardd Preferences SpringBoard kernel_task" > "$out/top-$1.txt" 2>&1 &
 	tp=$!
+	ssh9 "i=0; while [ \$i -lt $((${2:-4} * 8 + 4)) ]; do echo \$(date +%s) \$(sysctl -n kern.sweet_cpu_freq 2>/dev/null); sleep 0.5; i=\$((i + 1)); done" > "$out/freq-$1.txt" 2>&1 &
+	fq=$!
 	tools/s9-bench.sh 1 "${2:-4}" > "$out/bench-$1.txt" 2>&1
-	wait $tp
+	wait $tp $fq
 	snap "$1-after"
 	echo "$1: $(grep 'swaps/s' "$out/bench-$1.txt")"
 }
